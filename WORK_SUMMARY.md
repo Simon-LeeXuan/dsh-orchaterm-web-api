@@ -725,3 +725,76 @@ smoke 扩到 20 组（19：标签改道五情形；20：purpose 隔离键）；�
   只需 reportToolResult；若将来声明 mcpServers 需补 approve。
 - `onToolResult`（后端代执行结果帧）我们目前转成「上游工具」正文行，未结构化 —— 官方也只在
   mcp/system 场景用到，暂不需要。
+
+
+## 18. 流控制通道 / 回传重试 / 结果脱敏：官方语义完整移植（v0.5.0）
+
+用户目标不变：把客户端语义忠实移植进反代。本轮把 `orcaterm_start_core` 的**模块 2481**
+（完整 Agent 状态机，模块体 19.6KB，美化后 1063 行）逐行读完，并顺着依赖读了
+82752（路径表）/11232（设置存储）/72535（设置分发与 cid 生成）/67537（系统工具常量）/
+92054（user.setting 组装）/3222（工具帧判据）/82025（动作与 reviewAction 枚举）/
+32804（重试退避）/35482（Sn.fp）/26196（SSE 客户端）。
+
+### 18.1 流控制三件套（待办 1 全部解决）
+模块 2481 的四个函数给出官方语义（此前只有路径表，不知道怎么调）：
+- `It`（getStreamStatus）：`GET {base}/stream/status/{cid}`，查询 `name/mode/csrfCode/sseresume=true`
+  （`Tt()` 统一加 sseresume），返回 `{data:{status,chunkCount,taskId,error}}`；
+- `Rt`（resume）：status=running 时 `GET {base}/stream/resume/{cid}?…&offset=<streamChunkOffset>`，
+  SSE 续流，`initialContent` 带上已收正文防重复；
+- `Lt`（requestServerAbort）：`POST {base}/stream/abort/{cid}`，**空体 `{}`**；
+- `jt`（stop）：`本地 AbortController.abort()` **＋** `Lt()` —— 停止是双动作。
+- **会话 ID 在路径段**（`getRequestUrl` 的段拼接语义），不在查询串。
+
+### 18.2 回传重试公式（待办 2 解决）
+@78376 的实参 + 模块 32804 的公式：
+`SE(fn, {attempts:3, timeoutMs:15000, baseDelayMs:300, maxDelayMs:1500})`，
+退避 = `min(base·2ⁿ, max)` → 失败后等 300/600/1200ms。**单次尝试 15s 超时**（不是总超时）。
+反代的工具结果轮（round.reviewInput 存在）改用这套参数；普通轮维持 3 次/600ms。
+
+### 18.3 `Sn.fp` 真身：敏感信息脱敏器（待办 7 解决，且推翻原猜想）
+待办里猜它是「工具输出格式化器」——错了。模块 35482 逐条读：14 条正则做**凭据脱敏**
+（PEM 块/sk-/AKIA/ghp_/AIza/xox/sk_live/JWT/URL 凭据/Bearer/敏感赋值/CLI 密码参数），
+命中即替换为 `[已隐藏…]` 或 `***`。官方在**每次 reportToolResult 之前**跑一遍。
+已逐条移植为 `redactSecrets`（agent-protocol.js），回传前生效；smoke 21 用 10 种形态锁住。
+场景重放证明脱敏不影响消费：伪造结果带假 JWT，模型精确答出全部数字并提示「令牌已隐藏」。
+
+### 18.4 UI 工具全集与权限分类（待办 8 解决）
+@76135 的 En/Tn 两个 Set 是官方 orcaterm UI 工具**注册表全集**（23 项）：
+- headless（En，15 项，官方免确认自动执行）：execute_terminal_command、get_orcaterm_settings、
+  get_terminal_detail、get_terminal_output、list_terminals、login_by_connect_id、
+  query_agent_tasks_status、query_commands_status、read_cloud_space_file(_list)、
+  remote_glob/grep/read/write、send_terminal_signal；
+- foreground（Tn，8 项，需前台确认）：create/edit_cloud_space_file、remote_edit、
+  remote_multi_edit、run_commands、select_connect_config、submit_agent_tasks、
+  update_orcaterm_settings。
+分类器 `An`：type=system → server_system；mcpServer/type=mcp → server_mcp（先 approve，
+15s「确认工具执行」）；其余按名字落两集，未知 → foreground_required。
+移植为 `classifyUiToolCategory` + `UI_TOOL_HEADLESS`/`UI_TOOL_FOREGROUND`。
+`selectedUITools` 仍只声明 7 项 —— 全集里其余项依赖真实终端/云空间连接，声明了只换来失败。
+
+### 18.5 其余对齐点（均为一手源码事实）
+- `reviewAction` 全集（82025）：approve/feedback/cancel/reportToolResult/proceedToNextTool；
+  用户以**文本**回复 review 走 `feedback`（`ut` 的 resolveSendInput）。
+- `input.id` = `x-seqid`（Fe：`const {id: x} = e` → headers 与 input 同值）；已对齐。
+- 会话 ID 形态（72535 `generateConversationId`）：`cid-{id}` + `-{assistant}`（非 lighthouse）
+  + `-{mode}`（非 0）。orcaterm/mode0 → `cid-<uuid>-orcaterm`。provider 与后端都已改此形态；
+  老会话因此换新上游会话（一次性）。
+- 后端代执行结果帧判据（3222 `zV`）：id 匹配 `^run-.+-tool-.+`；该帧 content 是结果原文
+  （非 Agent JSON），不再喂解包器，改为带类别与脱敏摘要的可读行（待办 4 顺手解决）。
+- 子 Agent（待办 6）：30 轮上限确认（`for(s+=1;s<30;)`）；输入 `type:'start'` + 系统提示词数组；
+  每步 push 进 steps 状态机（thinking/tool/summary）；用户中止直接抛错。
+- `reasoningActive`（待办 5）：消息级布尔随 aiData 下发（@73109），客户端用于思考气泡状态；
+  我们已有双路径思维链，该标记无额外信息量，记录不消费。
+
+### 18.6 验证
+- `npm test` 全绿（smoke 20 → 24 组）；
+- 活体回归 17/17（重启后端 v0.5.0）；
+- 协议金标准重放 4/4（4711/2300/23 精确消费 + JWT 脱敏）；
+- 流控制端点真机：`/stream/status/{不存在的cid}` → `{status:'none',chunkCount:0,taskId:null,error:null}`、
+  `/stream/abort` → ok、`/orca/stream-url` 形态与官方抓包一致；stderr 空。
+
+### 18.7 边界与遗留
+- `/stream/resume` 只实现 URL/文档，未接入对话流（DSH 无续流概念）。
+- approve 路径（待办 3）仍未启用：我们无 mcpServers，分类器已备好，声明 mcpServers 时即用。
+- 「客户端中途掐断 → 补发 abort」的**上游侧效果**无法直接观测（上游不回执该调用的影响），
+  观测到的是 POST 正常返回；机制本身是官方 stop 语义的直接移植。

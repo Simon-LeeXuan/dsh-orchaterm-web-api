@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { OrcaTermWebApiAdapter, PROVIDER_ID, name, inject, apply } from '../lib/provider.js'
-import { classifyDataLine, cgiHeaders, assistantHeaders, identityOf, DESKTOP_IDENTITY } from '../backend/upstream.js'
+import { classifyDataLine, cgiHeaders, assistantHeaders, assistantBody, identityOf, DESKTOP_IDENTITY, streamControlUrl } from '../backend/upstream.js'
 import { csrfCodeOf } from '../backend/credentials.js'
 import { buildConfig, ensureFreshCredential } from '../backend/server.js'
 import { createContextTracker, fingerprintMessages } from '../lib/context.js'
@@ -8,16 +8,22 @@ import { DEFAULTS, MANAGER_KEYS } from '../lib/config.js'
 import { flattenContent, formatOpenAiMessages } from '../lib/openai.js'
 import {
   classifyCommandShell,
+  classifyUiToolCategory,
   createDeliveredHistory,
   createGreetingStripper,
   createRepeatStripper,
   createThinkingTagRouter,
   describeExecutionHost,
   parseToolEnvelope,
+  redactSecrets,
+  REPORT_RETRY_TIMEOUT_MS,
+  reportRetryBackoffMs,
   resolveDshToolCall,
   rewriteCommandChain,
   splitCommandChain,
   toWindowsPath,
+  UI_TOOL_FOREGROUND,
+  UI_TOOL_HEADLESS,
   wrapCommandForShell,
 } from '../backend/agent-protocol.js'
 
@@ -563,6 +569,87 @@ console.log('20. 验证辅助请求（purpose）不共用主会话键...')
   // 无 sessionId 的辅助请求也要有自己的键
   const t2 = adapter.conversationKey({ purpose: 'session-title', messages: [{ role: 'user', content: 'hi' }] })
   assert.ok(t2.startsWith('aux:session-title:'), t2)
+}
+
+console.log('21. 验证工具结果脱敏（官方 Sn.fp 移植 redactSecrets）...')
+{
+  // 21a. JWT 三段式（官方正则要求前两段都以 eyJ 开头）
+  assert.equal(
+    redactSecrets('token is eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeK-adQssw5c'),
+    'token is [已隐藏的 JWT 令牌]',
+  )
+  // 21b. API key / AWS / GitHub
+  assert.equal(redactSecrets('key sk-ant-abc123def456ghi789'), 'key [已隐藏的 API 密钥]')
+  assert.equal(redactSecrets('AKIAIOSFODNN7EXAMPLE'), '[已隐藏的 AWS 密钥]')
+  assert.ok(redactSecrets('ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234').includes('已隐藏'))
+  // 21c. Bearer
+  assert.equal(redactSecrets('Authorization: Bearer abcdef12345678'), 'Authorization: Bearer ***')
+  // 21d. 敏感赋值（password=xxx）与非敏感赋值（name=xxx 不动）
+  assert.equal(redactSecrets('db connect with password=hunter2 now'), 'db connect with password=*** now')
+  assert.equal(redactSecrets('run with name=abc'), 'run with name=abc')
+  // 21e. CLI 形态：sshpass / mysql -p / curl -u / --token
+  assert.ok(redactSecrets('sshpass -p s3cret ssh host').includes('***'))
+  assert.ok(redactSecrets('mysql -u root -ps3cret -h db').includes('***'))
+  assert.ok(redactSecrets('curl -u admin:topsecret https://x').includes('admin:***'))
+  assert.ok(redactSecrets('git push --token abc123def https://x').includes('***'))
+  // 21f. URL 内嵌凭据
+  assert.equal(
+    redactSecrets('postgres://admin:p4ss@db:5432/app'),
+    'postgres://admin:***@db:5432/app',
+  )
+  // 21g. 环境变量赋值
+  assert.ok(redactSecrets('PGPASSWORD=secret psql').includes('***'))
+  // 21h. PEM 私钥块
+  const pem = '-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----'
+  assert.equal(redactSecrets(pem), '[已隐藏的私钥证书]')
+  // 21i. 非字符串入参 → 空串（官方 s 函数语义）
+  assert.equal(redactSecrets(undefined), '')
+  assert.equal(redactSecrets(''), '')
+}
+
+console.log('22. 验证 UI 工具注册表与官方分类器 (classifyUiToolCategory)...')
+{
+  // 官方全集：headless 15 个 + foreground 8 个
+  assert.equal(UI_TOOL_HEADLESS.length, 15)
+  assert.equal(UI_TOOL_FOREGROUND.length, 8)
+  assert.ok(UI_TOOL_HEADLESS.includes('execute_terminal_command'))
+  assert.ok(UI_TOOL_FOREGROUND.includes('remote_edit'))
+  // 分类器：mcp → server_mcp；system → server_system；名字落两集；未知 → foreground_required
+  assert.equal(classifyUiToolCategory({ type: 'mcp', mcpServer: 'x', name: 'execute_command' }), 'server_mcp')
+  assert.equal(classifyUiToolCategory({ type: 'system', name: 'internal_fallback' }), 'server_system')
+  assert.equal(classifyUiToolCategory({ name: 'remote_read' }), 'headless_ui')
+  assert.equal(classifyUiToolCategory({ name: 'run_commands' }), 'foreground_required')
+  assert.equal(classifyUiToolCategory({ name: 'totally_unknown_tool' }), 'foreground_required')
+}
+
+console.log('23. 验证回传重试退避公式（官方 xn.SE：base*2^n 封顶 max）...')
+{
+  assert.equal(reportRetryBackoffMs(0), 300)
+  assert.equal(reportRetryBackoffMs(1), 600)
+  assert.equal(reportRetryBackoffMs(2), 1200)
+  assert.equal(reportRetryBackoffMs(3), 1500) // 封顶
+  assert.equal(reportRetryBackoffMs(9, { baseDelayMs: 250, maxDelayMs: 2000 }), 2000)
+  assert.equal(REPORT_RETRY_TIMEOUT_MS, 15000)
+}
+
+console.log('24. 验证官方对齐的请求细节（input.id=x-seqid / 流控制 URL / 会话 ID 形态）...')
+{
+  const cfg = buildConfig({ credential: { uin: 'u1', token: 't', csrfCode: 'c', assistantReady: true } })
+  // 24a. assistantBody：reviewInput 与普通输入都带 input.id
+  const b1 = assistantBody(cfg, { conversationId: 'cid-x-orcaterm', content: 'hi', inputId: 'seq-1' })
+  assert.equal(b1.input.id, 'seq-1')
+  const b2 = assistantBody(cfg, { conversationId: 'cid-x-orcaterm', content: 'hi', inputId: 'seq-2', reviewInput: { type: 'review', reviewAction: 'reportToolResult', toolResult: 'r', tool: { name: 'execute_command', args: {} } } })
+  assert.equal(b2.input.id, 'seq-2')
+  assert.equal(b2.input.type, 'review')
+  assert.equal(b2.input.files.length, 0)
+  // 24b. 流控制 URL：会话 ID 在路径段，查询串带 name/mode/csrfCode/sseresume
+  const abortUrl = streamControlUrl(cfg, '/stream/abort', 'cid-x-orcaterm')
+  assert.ok(abortUrl.includes('/assistant/stream/abort/cid-x-orcaterm'), abortUrl)
+  assert.ok(abortUrl.includes('name=orcaterm'), abortUrl)
+  assert.ok(abortUrl.includes('sseresume=true'), abortUrl)
+  // 24c. 官方会话 ID 形态：cid-<uuid>-orcaterm（不再用 cid-dsh- 前缀）
+  const cid = `cid-${'0123456789abcdef'.slice(0, 8)}-orcaterm`
+  assert.match(cid, /^cid-[0-9a-f]+-orcaterm$/)
 }
 
 console.log('smoke 测试全部通过！')

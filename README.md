@@ -92,11 +92,35 @@ cd C:\AITask\dsh-client-config\plugins\dsh-orchaterm-web-api
 
 ---
 
+## 官方语义移植（v0.4.0 / v0.5.0）
+
+1. **工具结果官方协议（v0.4.0）**：DSH 执行完工具，反代按官方子 Agent 循环的信封回传
+   `{type:'review', reviewAction:'reportToolResult', toolResult, tool}`（`tool` 为上游信封原件），
+   对照实验证明模型精确消费结果（旧的 `{TOOL_RESULT}` 文本协议时吃时忽略）。
+2. **流控制通道（v0.5.0）**：逆向 `orcaterm_start_core` 模块 2481 后移植 —— 会话 ID 放在路径段：
+   `GET /stream/status/{cid}`、`GET /stream/resume/{cid}?offset=N`、`POST /stream/abort/{cid}`（空体）。
+   **DSH 用户点停止时，反代在感知到客户端掐断且上游流未走完的情况下，自动补发
+   `POST /stream/abort/{cid}`**（官方 stop = 本地断流 + 通知服务端，双动作）。管理端点：
+   `POST /orca/stream-abort`、`GET /orca/stream-status?conversationId=`。
+3. **回传重试官方参数（v0.5.0）**：工具结果轮 `attempts=3`、单次 15s 超时、退避 300→600→1200ms
+   （`min(base·2ⁿ, max)`，模块 32804 公式 + @78376 实参）。
+4. **工具结果脱敏（v0.5.0）**：官方客户端回传前必过 `Sn.fp` —— 14 条正则把 PEM 私钥、
+   sk-/AKIA/ghp_/AIza/xox、JWT、URL 内嵌凭据、Bearer、敏感赋值、CLI 密码参数替换为
+   `[已隐藏…]`/`***`（模块 35482 逐条移植为 `redactSecrets`）。上游看到的工具结果形态与官方一致。
+5. **请求形态对齐（v0.5.0）**：`input.id` 与 `x-seqid` 同值；会话 ID 采用官方生成式
+   `cid-<id>-orcaterm`（模块 72535：`cid-{id}-{assistant}`，mode 0=RE_ACT 不加后缀）；
+   后端代执行结果帧（id 形如 `run-*-tool-*`）以带类别与脱敏摘要的可读行透出。
+6. **UI 工具官方全集（证据）**：headless 15 项（官方免确认）+ foreground 8 项（需确认），
+   见 `agent-protocol.js` 的 `UI_TOOL_HEADLESS`/`UI_TOOL_FOREGROUND` 与分类器
+   `classifyUiToolCategory`；`selectedUITools` 仍只声明可映射到 DSH 工具的 7 项。
+
+---
+
 ## 验证
 
 ```powershell
-npm test                       # 离线：cordis/DEFAULTS 静态校验 + 17 组 smoke（消息转换、剥离、判定、路由、映射、身份）
-npm run test:live:regression   # 活体：需反代在跑 + 有效登录态，16 项断言，会让模型真发工具调用
+npm test                       # 离线：cordis/DEFAULTS 静态校验 + 24 组 smoke（消息转换、剥离、判定、路由、映射、身份、脱敏、流控制）
+npm run test:live:regression   # 活体：需反代在跑 + 有效登录态，17 项断言，会让模型真发工具调用
 # 凭据说明（v0.3.3）：token 临期/过期时反代自动重读 OrcaTerm 桌面端登录态，并在认证失败时自动重试一次；
 # 只要桌面端开着就不用再手动重启反代。桌面端没开且 token 过期时报 AUTH 属预期。
 ```

@@ -1,5 +1,63 @@
 All notable changes to the `dsh-orchaterm-web-api` plugin will be documented in this file.
 
+## [0.5.0] - 2026-10-26
+
+继续逆向客户端 API 封装（`orcaterm_start_core` 模块 2481 = 完整 Agent 状态机，19.6KB 美化后
+1063 行逐行读毕），把流控制通道、回传重试语义、结果脱敏三块官方行为移植进反代。
+
+### 逆向发现（模块 2481/82752/32804/35482/11232/72535/67537，均为一手源码）
+1. **流控制三件套**（模块 2481 的 `It`/`Rt`/`Lt`/`jt`）：
+   - 会话 ID 放在**路径段**：`GET {base}/stream/status/{cid}`、`GET {base}/stream/resume/{cid}?offset=N`、
+     `POST {base}/stream/abort/{cid}`（空体 `{}`）；查询串统一 `name/mode/csrfCode/sseresume=true`；
+   - 官方「停止」= 本地 AbortController.abort() **＋** 服务端 abort POST（`jt`）；
+   - `/stream/resume`：页面重载后若 status=running，以 `offset=<已收 chunk 数>` 续流 SSE。
+2. **回传重试公式**（模块 32804 `SE` + @78376 实参）：`attempts=3, timeoutMs=15000,
+   baseDelayMs=300, maxDelayMs=1500`，退避 = `min(base·2ⁿ, max)` → 300/600/1200ms。
+3. **`Sn.fp` = 敏感信息脱敏器**（模块 35482，此前误以为是「格式化器」）：14 条正则把
+   PEM 私钥块、sk-/AKIA/ghp_/AIza/xox/sk_live、JWT、URL 内嵌凭据、Bearer、敏感 KEY=VALUE
+   赋值、CLI 密码参数（sshpass/mysql -p/redis-cli -a/curl -u）全部替换为 `[已隐藏…]`/`***`，
+   **回传工具结果前必过**。这是行为级等价——上游看到的工具结果形态与官方一致。
+4. **UI 工具官方全集与权限分类**（@76135 En/Tn + `An`）：headless 15 个（官方**免确认**自动
+   执行，含 remote_read/write/glob/grep、execute_terminal_command）、foreground 8 个
+   （需前台确认，含 run_commands、remote_edit）。mcp → 先 approve（15s）再由上游代执行；
+   system → 等前台。
+5. **`reviewAction` 全集**（模块 82025）：`approve / feedback / cancel / reportToolResult /
+   proceedToNextTool`；`feedback` 是用户以文本回复 review 的官方通道。
+6. **请求形态对齐点**：`input.id` 与 `x-seqid` 是**同一个值**（Fe）；会话 ID 形态
+   `cid-{id}-{assistant}`（orcaterm → `cid-<uuid>-orcaterm`，mode 0=RE_ACT 不加后缀）；
+   后端代执行结果帧的判据是 id 匹配 `^run-.+-tool-.+`（模块 3222 `zV`）。
+7. 子 Agent 循环 30 轮上限确认（`for(s+=1;s<30;)`），子 Agent 输入为 `type:'start'` +
+   独立系统提示词数组；用户中断子 Agent 时直接抛错中止。
+
+### Changed（行为级）
+- **DSH 用户点停止 → 通知上游中止**：provider 掐断到反代的连接时，若上游流未走完，
+  反代 fire-and-forget 补发 `POST /stream/abort/{cid}`（官方 stop 语义的完整移植）。
+- **工具结果轮的传输重试升级为官方参数**：attempts=3、单次 15s 超时、退避 300→600→1200ms；
+  普通轮维持既有 3 次/600ms。
+- **回传工具结果前先脱敏**（`redactSecrets`，官方 Sn.fp 逐条移植），转存指引在其后追加。
+- **请求对齐**：所有 input 补 `id = x-seqid`；新会话 ID 改为官方形态 `cid-<uuid>-orcaterm`
+  （provider 的稳定 id 同步改为 `cid-<hash>-orcaterm`；老会话因此换新上游会话，一次性成本）。
+- **后端工具结果帧结构化**：`run-*-tool-*` 帧不再喂给解包器（结果原文非 Agent JSON，
+  喂进去会污染兜底缓冲），改为带类别与脱敏摘要的可读行。
+- 新增管理端点：`POST /orca/stream-abort`、`GET /orca/stream-status?conversationId=`、
+  `GET /orca/stream-url?conversationId=&kind=abort|status|resume`（观察用）。
+
+### Verified
+- `npm test` 全绿（smoke 扩到 24 组：脱敏 10 形态、分类器、退避公式、input.id/流控制 URL/cid 形态）；
+- 活体回归 **17/17**；协议金标准重放 **4/4**（伪造 4711/2300/23 精确消费，假 JWT 被脱敏且
+  模型复述时提示「令牌已隐藏」）；
+- 流控制端点真机验证：`/stream/status/{不存在的cid}` → `{status:'none',chunkCount:0}`、
+  `/stream/abort` → ok；`/health` v0.5.0；stderr 空。
+
+### Notes / 边界
+- `/stream/resume` 已实现 URL 构造与文档，但未接入对话流（DSH 无续流概念；官方用于页面重载
+  后接回 running 流）。将来若要在认证重试中复用中断流，这里是入口。
+- 我们声明 `uiServers` 且 `mcpServers: []`，所以「mcp 先 approve」路径仍未启用（待办 3 保留）；
+  分类器与全集清单已移植（`classifyUiToolCategory` / `UI_TOOL_HEADLESS` / `UI_TOOL_FOREGROUND`），
+  将来声明 mcpServers 时按 `An` 分类走 approve 即可。
+- `selectedUITools` 仍只声明可真正映射到 DSH 工具的 7 项：官方全集 23 项里其余 16 项
+  （get_terminal_output、list_terminals 等）依赖真实终端连接，声明了只会换来模型调用失败。
+
 ## [0.4.0] - 2026-10-25
 
 按用户要求**原样逆向 OrcaTerm 客户端的 API 封装**（REA + 线上明文 bundle），据实测把工具结果

@@ -762,3 +762,192 @@ export function describeExecutionHost(env = {}) {
   }
   return `执行环境：${platform}${where}（命令在调用方主机的当前会话目录执行，不是云端沙箱），命令由 bash 执行，请使用 POSIX shell 语法。`
 }
+
+// ─────────────────────────────────────────────────────────────
+// 6. 工具结果回传前的敏感信息脱敏（官方 Sn.fp 的逐条移植）
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 官方客户端在 `reportToolResult` 回传前，先用 `Sn.fp`（线上 bundle 模块 35482，
+ * `orcaterm_start.zh.decf2b6a285396d427d2.js` @15689）把工具输出里的凭据脱敏成
+ * `[已隐藏…]` 占位符，再交给上游。这是**行为级等价**的一部分：上游看到的工具结果
+ * 应该与官方客户端发出的形态一致。以下 14 条规则按官方源码逐条移植，顺序即官方顺序。
+ */
+
+const REDACT_LABEL = (label) => `[已隐藏${label}]`
+const REDACT_KEY_BLOCK = REDACT_LABEL('的私钥证书')
+const REDACT_API_KEY = REDACT_LABEL('的 API 密钥')
+const REDACT_AWS_KEY = REDACT_LABEL('的 AWS 密钥')
+const REDACT_GITHUB_TOKEN = REDACT_LABEL('的 GitHub 令牌')
+const REDACT_GOOGLE_KEY = REDACT_LABEL('的 Google API 密钥')
+const REDACT_SLACK_TOKEN = REDACT_LABEL('的 Slack 令牌')
+const REDACT_STRIPE_KEY = REDACT_LABEL('的 Stripe 密钥')
+const REDACT_JWT = REDACT_LABEL('的 JWT 令牌')
+
+/** 官方规则 11 用的「敏感键名」判定（password/passwd/secret/token/apikey/… 结尾即视为敏感）。 */
+function isSensitiveAssignKey(rawKey) {
+  const normalized = String(rawKey || '').toLowerCase().replace(/[-_]/g, '')
+  if (/pwd$/.test(normalized)) return /[-_]pwd$/i.test(rawKey)
+  return /(?:password|passwd|secretkey|secret|token|apikey|accesskey|accesstoken|refreshtoken|authtoken|clientsecret|privatekey|credentials?|auth)$/.test(normalized)
+}
+
+/** 拆出赋值右值两侧的引号（官方 c 函数）。 */
+function splitQuotedValue(value) {
+  const first = value[0]
+  const last = value[value.length - 1]
+  const quote = value.length >= 2 && (first === "'" || first === '"') && first === last ? first : ''
+  return { quote, value: quote ? value.slice(1, -1) : value }
+}
+
+/** 官方规则 11/12 共用的「右值替换为 ***，保留原引号」处理（官方 a 函数）。 */
+function redactAssignValue(_match, prefix, sep, rawValue) {
+  const { quote } = splitQuotedValue(rawValue)
+  return `${prefix}${sep}${quote}***${quote}`
+}
+
+const REDACTION_RULES = [
+  // 1) PEM 私钥/证书块
+  { pattern: /-----BEGIN[^-]*?(?:PRIVATE KEY|CERTIFICATE)-----[\s\S]*?-----END[^-]*?(?:PRIVATE KEY|CERTIFICATE)-----/gi, replacement: REDACT_KEY_BLOCK },
+  // 2) Anthropic / OpenAI 风格 API key
+  { pattern: /\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\b/g, replacement: REDACT_API_KEY },
+  // 3) AWS AccessKey
+  { pattern: /\bAKIA[0-9A-Z]{16}\b/g, replacement: REDACT_AWS_KEY },
+  // 4) GitHub token
+  { pattern: /\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}\b/g, replacement: REDACT_GITHUB_TOKEN },
+  // 5) Google API key
+  { pattern: /\bAIza[0-9A-Za-z_-]{20,}\b/g, replacement: REDACT_GOOGLE_KEY },
+  // 6) Slack token
+  { pattern: /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/g, replacement: REDACT_SLACK_TOKEN },
+  // 7) Stripe key
+  { pattern: /\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}\b/g, replacement: REDACT_STRIPE_KEY },
+  // 8) JWT（三段式）
+  { pattern: /\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, replacement: REDACT_JWT },
+  // 9) URL 内嵌用户名:密码（保留协议与用户名）
+  { pattern: /((?:https?|ftp|smtp|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis):\/\/[^/\s:@]+:)[^/\s:@]+@/gi, replacement: '$1***@' },
+  // 10) Bearer 令牌
+  { pattern: /\b(Bearer\s+)[A-Za-z0-9._-]{10,}/gi, replacement: '$1***' },
+  // 11) KEY=VALUE / KEY: VALUE 赋值（键名敏感才替换；嵌套含 = 的值递归处理）
+  {
+    pattern: /\b([A-Za-z_][A-Za-z0-9_-]*)(["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s"';|&]+)/g,
+    replacement: (match, key, sep, rawValue) => {
+      if (!isSensitiveAssignKey(key)) {
+        const { quote, value } = splitQuotedValue(rawValue)
+        if (value.includes('=')) {
+          const inner = redactSecrets(value)
+          if (inner !== value) return `${key}${sep}${quote}${inner}${quote}`
+        }
+        return match
+      }
+      return redactAssignValue(match, key, sep, rawValue)
+    },
+  },
+  // 12) CLI 长参数 --password/--token/--secret/…
+  { pattern: /(--(?:password|token|secret|api-?key|access-?key|auth-?token))(\s+|=)("[^"]*"|'[^']*'|[^\s"';|&]+)/gi, replacement: redactAssignValue },
+  // 13) 常见数据库/云 CLI 的环境变量赋值
+  { pattern: /\b(MYSQL_PWD|PGPASSWORD|REDISCLI_AUTH|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|GITHUB_TOKEN)(["']?\s*=\s*["']?)([^\s"';|&]+)/gi, replacement: '$1$2***' },
+  // 14a) sshpass -p
+  { pattern: /(\bsshpass\s+-p\s*["']?)(?!--)[^\s"';|&)]+/gi, replacement: '$1***' },
+  // 14b) mysql 系列的 -p 密码
+  { pattern: /(\b(?:mysql|mysqladmin|mysqldump|mysqlimport|mysqlshow|mariadb(?:-(?:admin|dump|import|show))?)\b[^\r\n;|&]*?\s-p)(["']?)([^\s"';|&)]+)\2/gi, replacement: '$1$2***$2' },
+  // 14c) redis-cli -a / --pass
+  { pattern: /(\bredis-cli\b[^\r\n;|&]*?\s(?:-a(?:\s+)?|--pass(?:=|\s+)))(["']?)(?!--)([^\s"';|&)]+)\2/gi, replacement: '$1$2***$2' },
+  // 14d) curl -u / --user（user:password 保留用户名）
+  {
+    pattern: /(\bcurl\b[^\r\n;|&]*?\s(?:-u(?:\s+)?|--(?:user|proxy-user)(?:=|\s+)))(["']?)(?!--)([^\s"';|&)]+)\2/gi,
+    replacement: (_match, prefix, quote, value) => {
+      const colon = value.indexOf(':')
+      const masked = colon < 0 ? '***' : `${value.slice(0, colon)}:***`
+      return `${prefix}${quote}${masked}${quote}`
+    },
+  },
+]
+
+/**
+ * 对工具输出做官方同款脱敏。非字符串入参原样返回空串（官方 s 函数语义）。
+ * @param {unknown} text
+ * @returns {string}
+ */
+export function redactSecrets(text) {
+  if (typeof text !== 'string' || text === '') return ''
+  let out = text
+  for (const rule of REDACTION_RULES) out = out.replace(rule.pattern, rule.replacement)
+  return out
+}
+
+// ─────────────────────────────────────────────────────────────
+// 7. UI 工具注册表与执行类别（官方 An 分类器的移植）
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 官方客户端的 orcaterm UI 工具全集（`orcaterm_start.zh…js` @76135 附近，En/Tn 两个 Set）：
+ * - headless（En）：官方客户端**无需用户确认**自动执行的只读/查询类工具；
+ * - foreground（Tn）：需要前台确认的写操作/危险操作。
+ * 我们声明 uiServers 时仍只挑能真正映射到 DSH 工具的子集（见 upstream.assistantBody），
+ * 这里保留官方全集作为证据与未来扩展的依据。
+ */
+export const UI_TOOL_HEADLESS = Object.freeze([
+  'execute_terminal_command',
+  'get_orcaterm_settings',
+  'get_terminal_detail',
+  'get_terminal_output',
+  'list_terminals',
+  'login_by_connect_id',
+  'query_agent_tasks_status',
+  'query_commands_status',
+  'read_cloud_space_file',
+  'read_cloud_space_file_list',
+  'remote_glob',
+  'remote_grep',
+  'remote_read',
+  'remote_write',
+  'send_terminal_signal',
+])
+
+export const UI_TOOL_FOREGROUND = Object.freeze([
+  'create_cloud_space_file',
+  'edit_cloud_space_file',
+  'remote_edit',
+  'remote_multi_edit',
+  'run_commands',
+  'select_connect_config',
+  'submit_agent_tasks',
+  'update_orcaterm_settings',
+])
+
+/**
+ * 官方 An({name,type,mcpServer}) 分类器：决定一个工具信封由谁执行、要不要先 approve。
+ * - system 类型 → 服务端系统工具（等用户前台确认）；
+ * - 带 mcpServer 或 type=mcp → 服务端 MCP（先发 approve，由上游代执行）；
+ * - 其余按名字落 headless/foreground 两类。
+ * @param {{name?:string, type?:string, mcpServer?:string, toolType?:string}} tool
+ * @returns {'server_system'|'server_mcp'|'headless_ui'|'foreground_required'}
+ */
+export function classifyUiToolCategory(tool = {}) {
+  const type = String(tool.type || tool.toolType || '').trim()
+  if (type === 'system') return 'server_system'
+  if (tool.mcpServer || type === 'mcp') return 'server_mcp'
+  const name = String(tool.name || '').trim()
+  if (UI_TOOL_FOREGROUND.includes(name)) return 'foreground_required'
+  if (UI_TOOL_HEADLESS.includes(name)) return 'headless_ui'
+  return 'foreground_required'
+}
+
+// ─────────────────────────────────────────────────────────────
+// 8. 回传重试退避（官方 xn.SE 的公式移植）
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 官方回传工具结果的退避序列（模块 32804：delay = min(base * 2^n, max)）。
+ * 实测参数（@78376）：attempts=3, timeoutMs=15000, baseDelayMs=300, maxDelayMs=1500
+ * → 重试前的等待是 300ms、600ms（第三次直接发，不再等待）。
+ * @param {number} attempt 第几次失败后的等待（0 起）
+ * @param {{baseDelayMs?:number, maxDelayMs?:number}} [options]
+ */
+export function reportRetryBackoffMs(attempt, options = {}) {
+  const base = Math.max(0, options.baseDelayMs ?? 300)
+  const max = Math.max(base, options.maxDelayMs ?? 1500)
+  return Math.min(base * 2 ** attempt, max)
+}
+
+/** 官方回传超时：单次尝试 15s（`回传工具结果` 操作的 timeoutMs）。 */
+export const REPORT_RETRY_TIMEOUT_MS = 15000

@@ -221,16 +221,63 @@ export const UPSTREAM_MODEL_MAP = Object.freeze({
 })
 
 /**
+ * 流控制通道（逆向 orcaterm_start_core 模块 2481/82752，2026-10-25）：
+ *
+ * 官方客户端的「停止」= 本地 AbortController.abort() + `Lt()`：
+ *   POST {assistantBase}/stream/abort/{conversationId}?name=&mode=&csrfCode=&sseresume=true
+ *   体为空对象 `{}`，响应 `{data}`。
+ * 「断线重连」用 `/stream/resume/{cid}?...&offset=<已收 chunk 数>`（GET，SSE 续流），
+ * 前置探测用 `/stream/status/{cid}`（GET → `{status:'running'|...}`）。
+ * 会话 ID 放在**路径段**里，查询串只带 name/mode/csrfCode/sseresume。
+ */
+
+/** 拼 `/{path}/{conversationId}` 形态的流控制 URL（官方 getRequestUrl 的段拼接语义）。 */
+export function streamControlUrl(config, path, conversationId, extra = {}) {
+  return assistantQuery(config, `${path}/${encodeURIComponent(String(conversationId || ''))}`, extra)
+}
+
+/** 官方 stop() 的服务端半边：通知上游中止该会话的运行中流。fire-and-forget 场景不抛错。 */
+export async function assistantAbort(config, conversationId) {
+  try {
+    await fetch(streamControlUrl(config, ASSISTANT_PATHS.streamAbort, conversationId), {
+      method: 'POST',
+      headers: { ...assistantHeaders(config), Accept: 'application/json' },
+      body: '{}',
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 查询会话流状态（官方 It()）：返回 `{status:...}` 或 null。 */
+export async function assistantStreamStatus(config, conversationId) {
+  try {
+    const res = await fetch(streamControlUrl(config, ASSISTANT_PATHS.streamStatus, conversationId), {
+      method: 'GET',
+      headers: assistantHeaders(config),
+    })
+    if (!res.ok) return null
+    const payload = await res.json().catch(() => null)
+    return payload?.data || null
+  } catch {
+    return null
+  }
+}
+
+/**
  * 组一次 assistant 请求体（对齐前端 `assistant_request.body`）。
  * @param {object} config
  * @param {{conversationId:string, content:string, model:string, history?:Array,
  *          enableThinking?:boolean, tools?:Array, type?:string, toolResultText?:string,
- *          sendHistoryMessages?:boolean, envPrompt?:string}} input
+ *          sendHistoryMessages?:boolean, envPrompt?:string, inputId?:string}} input
  *   `tools` 为 OpenAI function 形态数组，原样透传给上游 Agent 网关；
  *   `enableThinking` 缺省视为 true（推理模型才有思维链，非推理模型由网关自行忽略）。
  *   `uiServers` 与 `selectedUITools` 激活 OrcaTerm 客户端自主工具（命令执行/文件读写等），
  *   使模型在遇到运维任务时主动通过 action: "review" 下发工具调用，而不是拒绝或幻觉。
  *   `envPrompt` 是执行环境自述（见 agent-protocol.js），拼在 emphasisPrompt 里。
+ *   `inputId`：官方 Fe 把 input 的消息 id 与 `x-seqid` 设成**同一个值**（模块 2481：
+ *   `const {id: x = Ub()} = e` → headers `x-seqid: x`、`input.id = x`），这里对齐。
  *
  * ## 关于 historyMessages（2026-10-24 实测，默认不发）
  *
@@ -285,9 +332,15 @@ export function assistantBody(config, input) {
       //   {type:'review', reviewAction:'reportToolResult', toolResult, tool}
       // 实测对照：该协议下模型精确消费结果内容；而旧的 type:'ask' + {TOOL_RESULT} 文本
       // 会被模型当作普通用户消息时吃时忽略（"总数 0 / 未收到数据"症状的根源）。
-      ? { ...input.reviewInput }
+      // 官方 Fe 对**所有** input 类型都补 {id, emphasisPrompt, files}（模块 2481）。
+      ? {
+        ...input.reviewInput,
+        ...(input.inputId ? { id: input.inputId } : {}),
+        files: [],
+      }
       : {
         type: payloadType,
+        ...(input.inputId ? { id: input.inputId } : {}),
         input: payloadContent,
         content: payloadContent,
         emphasisPrompt,

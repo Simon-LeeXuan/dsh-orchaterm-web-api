@@ -16,28 +16,35 @@ import { createServer } from 'node:http'
 
 import {
   ASSISTANT_PATHS,
+  assistantAbort,
   assistantBody,
   assistantHeaders,
   assistantQuery,
+  assistantStreamStatus,
   cgiCall,
   classifyDataLine,
   DESKTOP_IDENTITY,
   identityOf,
   newSeqId,
+  streamControlUrl,
 } from './upstream.js'
 import {
   createDeliveredHistory,
   createGreetingStripper,
   createRepeatStripper,
   createThinkingTagRouter,
+  classifyUiToolCategory,
   describeExecutionHost,
   parseToolEnvelope,
+  redactSecrets,
+  REPORT_RETRY_TIMEOUT_MS,
+  reportRetryBackoffMs,
   resolveDshToolCall,
   resolvePosixShell,
 } from './agent-protocol.js'
 import { redact, resolveCredentials, cookieHeaderFor, decodeJwtExp } from './credentials.js'
 
-export const VERSION = '0.4.0'
+export const VERSION = '0.5.0'
 
 /** 能力自述：插件的 contract.js 按这份清单决定是否复用已起的后端。 */
 export const CAPABILITIES = Object.freeze([
@@ -203,7 +210,7 @@ function toAssistantInput(messages) {
       else if (toolName === 'write') orcaTag = 'remote_write'
       else if (toolName === 'glob') orcaTag = 'remote_glob'
       else if (toolName === 'grep') orcaTag = 'remote_grep'
-      toolResults.push(`{TOOL_RESULT}(${orcaTag}): ${appendSpillHint(rawText)}`)
+      toolResults.push(`{TOOL_RESULT}(${orcaTag}): ${appendSpillHint(redactSecrets(rawText))}`)
       // 官方协议的原样 tool 对象：优先取下发时记住的信封原件，丢档时按映射反推。
       const lastAssMsg2 = lastAssistantIdx >= 0 ? list[lastAssistantIdx] : null
       const matched = Array.isArray(lastAssMsg2?.tool_calls)
@@ -212,7 +219,8 @@ function toAssistantInput(messages) {
       const origTool = ORIG_TOOL_BY_CALL.get(m.tool_call_id)
         ?? reconstructOrcaTool(matched?.function?.name || toolName, matched?.function?.arguments || '{}')
       reviewTools.push(origTool)
-      reviewTexts.push(appendSpillHint(rawText))
+      // 官方客户端回传前先用 Sn.fp 脱敏（模块 35482 → redactSecrets），转存指引在其后追加。
+      reviewTexts.push(appendSpillHint(redactSecrets(rawText)))
     } else {
       const text = typeof m?.content === 'string'
         ? m.content
@@ -478,7 +486,10 @@ async function handleChat(config, req, res) {
   // 本轮是否发历史：默认不发（上游会回灌污染正文）；但调用方做「上下文对账」后判定需要
   // 补发时（换新会话同步 DSH 的压缩结果）可以逐轮覆盖 —— provider 传 orca_send_history。
   const sendHistory = config.sendHistoryMessages === true || payload.orca_send_history === true
-  const conversationId = req.headers['x-orca-conversation-id'] || payload.user || `cid-dsh-${newSeqId()}`
+  // 官方 generateConversationId（模块 72535）：`cid-{id}` + `-{assistant}`（assistant≠lighthouse）
+  // + `-{mode}`（mode≠0）。orcaterm 的 assistant 名不是 lighthouse、mode 0 = RE_ACT，
+  // 所以官方会话 ID 形如 `cid-<uuid>-orcaterm` —— 这里对齐同一形态。
+  const conversationId = req.headers['x-orca-conversation-id'] || payload.user || `cid-${newSeqId()}-orcaterm`
   const wantStream = payload.stream === true
 
   return serveChat(config, req, res, payload, {
@@ -504,12 +515,15 @@ async function handleChat(config, req, res) {
 async function serveChat(config, req, res, payload, round) {
   const { wantStream } = round
   const content = round.content
+  const seqId = newSeqId()
   const body = assistantBody(config, {
     conversationId: round.conversationId,
     content,
     type: round.type,
     toolResultText: round.toolResultText,
     reviewInput: round.reviewInput,
+    // 官方对齐：input.id 与 x-seqid 是同一个值（模块 2481 的 Fe）。
+    inputId: seqId,
     model: payload.model || config.model,
     history: round.history,
     tools: toUpstreamTools(payload.tools),
@@ -518,24 +532,30 @@ async function serveChat(config, req, res, payload, round) {
     envPrompt: ENV_PROMPT,
     sendHistoryMessages: round.sendHistory === true,
   })
-  const seqId = newSeqId()
   const url = assistantQuery(config)
 
+  // 传输层重试。官方对 reportToolResult 的回传语义（@78376 + 模块 32804）：
+  // attempts=3、单次 15s 超时、退避 300→600ms（base*2^n 封顶 1500）。工具结果轮用官方参数，
+  // 普通轮维持既有的 3 次 / 600ms 固定退避。
+  const isToolReport = round.reviewInput != null
   let upstream
   let lastFetchErr = null
   for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const attemptSignal = isToolReport ? AbortSignal.timeout(REPORT_RETRY_TIMEOUT_MS) : undefined
     try {
       upstream = await fetch(url, {
         method: 'POST',
         headers: assistantHeaders(config, seqId),
         body: JSON.stringify(body),
+        ...(attemptSignal ? { signal: attemptSignal } : {}),
         ...(payload._signal ? { signal: payload._signal } : {}),
       })
       if (upstream.ok || upstream.status < 500) break
     } catch (error) {
       lastFetchErr = error
       if (attempt < 3) {
-        await new Promise((r) => setTimeout(r, 600))
+        const delay = isToolReport ? reportRetryBackoffMs(attempt - 1) : 600
+        await new Promise((r) => setTimeout(r, delay))
         continue
       }
     }
@@ -596,6 +616,12 @@ async function serveChat(config, req, res, payload, round) {
   let reasoning = ''
   let toolCalls = 0
   let terminal = null
+
+  // 官方 stop 语义（模块 2481 jt）：客户端停止 = 本地断流 + 通知服务端中止该会话的流。
+  // DSH 用户点停止时 provider 会掐断到反代的连接 —— 这里感知「流没走完客户端就走了」，
+  // fire-and-forget 地给上游补一刀 /stream/abort，避免上游继续为已无人听的会话烧 token。
+  let clientGone = false
+  res.on('close', () => { clientGone = true })
 
   const pushDelta = (delta) => { if (wantStream) { beginStream(); head(delta) } }
 
@@ -989,6 +1015,29 @@ export async function startServer(options = {}) {
       }
       if (req.method === 'POST' && url.pathname === '/orca/cgi') {
         return await handleCgi(config, req, res)
+      }
+      // 流控制通道（官方 /stream/* 的直通口，会话 ID 在路径段；见 upstream.streamControlUrl）。
+      // conversationId 优先取请求体/查询串，缺省回退到 x-orca-conversation-id 头。
+      if (req.method === 'POST' && url.pathname === '/orca/stream-abort') {
+        const body = await readJson(req)
+        const cid = String(body?.conversationId || url.searchParams.get('conversationId') || req.headers['x-orca-conversation-id'] || '')
+        if (!cid) return json(res, 400, { ok: false, error: { message: '需要 conversationId' } })
+        const ok = await assistantAbort(config, cid)
+        return json(res, ok ? 200 : 502, { ok, action: 'stream-abort', conversationId: cid })
+      }
+      if (req.method === 'GET' && url.pathname === '/orca/stream-status') {
+        const cid = String(url.searchParams.get('conversationId') || req.headers['x-orca-conversation-id'] || '')
+        if (!cid) return json(res, 400, { ok: false, error: { message: '需要 conversationId 查询参数' } })
+        const status = await assistantStreamStatus(config, cid)
+        return json(res, 200, { ok: status !== null, conversationId: cid, status })
+      }
+      // 仅供观察：把将会发出的流控制 URL 暴露出来（不含凭据），便于对照官方抓包。
+      if (req.method === 'GET' && url.pathname === '/orca/stream-url') {
+        const cid = String(url.searchParams.get('conversationId') || '')
+        const kind = String(url.searchParams.get('kind') || 'abort')
+        const path = kind === 'status' ? ASSISTANT_PATHS.streamStatus : kind === 'resume' ? ASSISTANT_PATHS.streamResume : ASSISTANT_PATHS.streamAbort
+        if (!cid) return json(res, 400, { ok: false, error: { message: '需要 conversationId 查询参数' } })
+        return json(res, 200, { ok: true, url: streamControlUrl(config, path, cid) })
       }
       if (req.method === 'GET' && url.pathname === '/orca/quota') {
         const result = await cgiCall(config, 'DescribeUserBillingStatus', {})
