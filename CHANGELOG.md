@@ -1,5 +1,28 @@
 All notable changes to the `dsh-orchaterm-web-api` plugin will be documented in this file.
 
+## [0.5.1] - 2026-10-26
+
+补上 v0.5.0 逆向中发现但未接线的最后一个用户侧通道：**未决 review 的用户文本反馈**。
+
+### 逆向依据
+模块 2481 `ut`（resolveSendInput）：上一信封 `action:"review"` 时，用户打字不产生新 `start`，
+而是 `{reviewAction:'feedback', input:<文本>, tool:<未决工具原件>}` 续进同一 review 循环；
+`feedback` 与 `approve/cancel/reportToolResult/proceedToNextTool` 同属 reviewAction 枚举（模块 82025）。
+
+### Changed
+- **`toAssistantInput` 新增 feedback 分支**：最后一个 assistant 带 `tool_calls` 且 DSH 没回任何
+  `role:'tool'`、用户直接打字/改口时，发 `{type:'review', reviewAction:'feedback', input, tool}`
+  （tool 优先取信封原件 LRU，丢档走反推）。此前误发 `start`，上游挂着的 review 得不到回应。
+  优先级：工具结果轮（reportToolResult）> feedback > start；上个 assistant 是纯文本时不触发。
+- **reviewInput 分支补 `emphasisPrompt` 字段**：官方 `Fe` 对所有 input 类型统一注入
+  `{id, emphasisPrompt, files}`，v0.5.0 只补了 `id/files`，这次补齐（空值）。
+
+### Verified
+- `npm test` 全绿（smoke 24 → 25 组：feedback 判定、reportToolResult 优先、start 不误触发、首轮不受影响）；
+- feedback 场景活体重放 **2/2**：工具调用后用户改口「先不用查了」，模型把话理解为对未决工具的
+  反馈、正常应答且**不重发工具调用**；
+- 活体回归 **17/17**；`/health` v0.5.1；stderr 空。
+
 ## [0.5.0] - 2026-10-26
 
 继续逆向客户端 API 封装（`orcaterm_start_core` 模块 2481 = 完整 Agent 状态机，19.6KB 美化后

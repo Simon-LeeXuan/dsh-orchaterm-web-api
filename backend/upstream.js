@@ -336,6 +336,8 @@ export function assistantBody(config, input) {
       ? {
         ...input.reviewInput,
         ...(input.inputId ? { id: input.inputId } : {}),
+        // 官方 Fe 对所有 input 类型统一补 {id, emphasisPrompt, files}（模块 2481）。
+        emphasisPrompt: input.reviewEmphasis || '',
         files: [],
       }
       : {

@@ -113,6 +113,9 @@ cd C:\AITask\dsh-client-config\plugins\dsh-orchaterm-web-api
 6. **UI 工具官方全集（证据）**：headless 15 项（官方免确认）+ foreground 8 项（需确认），
    见 `agent-protocol.js` 的 `UI_TOOL_HEADLESS`/`UI_TOOL_FOREGROUND` 与分类器
    `classifyUiToolCategory`；`selectedUITools` 仍只声明可映射到 DSH 工具的 7 项。
+7. **未决 review 的用户反馈通道（v0.5.1）**：模型发过工具调用而 DSH 未回工具结果、用户直接
+   打字改口时，反代按官方 `ut` 语义发 `{reviewAction:'feedback', input, tool}` 续进同一 review
+   循环（而非误开新 `start`，让上游挂着的 review 悬空）。
 
 ---
 

@@ -44,7 +44,7 @@ import {
 } from './agent-protocol.js'
 import { redact, resolveCredentials, cookieHeaderFor, decodeJwtExp } from './credentials.js'
 
-export const VERSION = '0.5.0'
+export const VERSION = '0.5.1'
 
 /** 能力自述：插件的 contract.js 按这份清单决定是否复用已起的后端。 */
 export const CAPABILITIES = Object.freeze([
@@ -143,7 +143,8 @@ function appendSpillHint(rawText) {
     + `-Tail 100（看结尾）、或 Select-Object -Skip N -First M（看中段），也可以直接在文件上统计（Measure-Object / Select-String）。`
 }
 
-function toAssistantInput(messages) {
+/** OpenAI messages → assistant 单轮输入（导出供单测；行为见内注）。 */
+export function toAssistantInput(messages) {
   const list = Array.isArray(messages) ? messages : []
 
   // 找到最后一个 assistant 消息的索引
@@ -252,6 +253,32 @@ function toAssistantInput(messages) {
         reviewAction: 'reportToolResult',
         toolResult: merged,
         tool: reviewTools[0] ?? reconstructOrcaTool('pwsh', '{}'),
+      },
+      history,
+    }
+  }
+
+  // 官方 resolveSendInput（模块 2481 `ut`）：上一回合仍是未决 review（assistant 发了 tool_calls
+  // 但 DSH 没回任何 tool 结果，用户直接打字/改口）时，官方客户端**不新开 start**，而是
+  // {type:'review', reviewAction:'feedback', input:<文本>, tool:<未决工具原件>} —— 把用户的话
+  // 作为对该工具调用的反馈续进同一个 review 循环。我们此前会误发 start，上游挂着的 review
+  // 得不到回应，与新指令互相打架。
+  const pendingCalls = lastAssistantIdx >= 0 && Array.isArray(list[lastAssistantIdx]?.tool_calls)
+    ? list[lastAssistantIdx].tool_calls
+    : []
+  const feedbackText = currentParts.join('\n\n')
+  if (pendingCalls.length > 0 && feedbackText) {
+    const firstCall = pendingCalls[0]
+    const origTool = ORIG_TOOL_BY_CALL.get(firstCall?.id)
+      ?? reconstructOrcaTool(firstCall?.function?.name || 'pwsh', firstCall?.function?.arguments || '{}')
+    return {
+      content: feedbackText,
+      type: 'review',
+      reviewInput: {
+        type: 'review',
+        reviewAction: 'feedback',
+        input: feedbackText,
+        tool: origTool,
       },
       history,
     }

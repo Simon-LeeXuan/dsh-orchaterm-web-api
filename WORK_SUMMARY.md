@@ -798,3 +798,13 @@ smoke 扩到 20 组（19：标签改道五情形；20：purpose 隔离键）；�
 - approve 路径（待办 3）仍未启用：我们无 mcpServers，分类器已备好，声明 mcpServers 时即用。
 - 「客户端中途掐断 → 补发 abort」的**上游侧效果**无法直接观测（上游不回执该调用的影响），
   观测到的是 POST 正常返回；机制本身是官方 stop 语义的直接移植。
+
+### 18.8 feedback 通道补线（v0.5.1）
+18.5 节记了 `reviewAction` 全集但没接线。补上：最后一个 assistant 带 `tool_calls` 且 DSH 没回
+任何 tool 结果、用户直接打字时，官方 `ut` 走 `{reviewAction:'feedback', input, tool}` 续进同一
+review 循环 —— 我们此前误发 `start`，上游挂着的 review 得不到回应。实现为 `toAssistantInput`
+的 feedback 分支（优先级 reportToolResult > feedback > start），`reviewInput` 分支同时补齐
+官方 `Fe` 统一注入的 `emphasisPrompt`（v0.5.0 只补了 id/files）。
+
+验证：smoke 25 组全绿；feedback 活体重放 2/2（工具调用后用户改口，模型按反馈应答、不重发
+工具）；活体回归 17/17。

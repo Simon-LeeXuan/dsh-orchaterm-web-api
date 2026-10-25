@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { OrcaTermWebApiAdapter, PROVIDER_ID, name, inject, apply } from '../lib/provider.js'
 import { classifyDataLine, cgiHeaders, assistantHeaders, assistantBody, identityOf, DESKTOP_IDENTITY, streamControlUrl } from '../backend/upstream.js'
 import { csrfCodeOf } from '../backend/credentials.js'
-import { buildConfig, ensureFreshCredential } from '../backend/server.js'
+import { buildConfig, ensureFreshCredential, toAssistantInput } from '../backend/server.js'
 import { createContextTracker, fingerprintMessages } from '../lib/context.js'
 import { DEFAULTS, MANAGER_KEYS } from '../lib/config.js'
 import { flattenContent, formatOpenAiMessages } from '../lib/openai.js'
@@ -650,6 +650,41 @@ console.log('24. 验证官方对齐的请求细节（input.id=x-seqid / 流控�
   // 24c. 官方会话 ID 形态：cid-<uuid>-orcaterm（不再用 cid-dsh- 前缀）
   const cid = `cid-${'0123456789abcdef'.slice(0, 8)}-orcaterm`
   assert.match(cid, /^cid-[0-9a-f]+-orcaterm$/)
+}
+
+console.log('25. 验证未决 review 的用户文本走 feedback 通道（官方 ut 语义）...')
+{
+  const toolCalls = [{ id: 'call_x_1', type: 'function', function: { name: 'pwsh', arguments: '{"command":"dir"}' } }]
+  // 25a. assistant 发了 tool_calls、用户没回工具结果直接打字 → review+feedback，带未决工具原件
+  const fb = toAssistantInput([
+    { role: 'user', content: '帮我看看目录' },
+    { role: 'assistant', content: '', tool_calls: toolCalls },
+    { role: 'user', content: '别跑了，换个方式' },
+  ])
+  assert.equal(fb.type, 'review')
+  assert.equal(fb.reviewInput.type, 'review')
+  assert.equal(fb.reviewInput.reviewAction, 'feedback')
+  assert.equal(fb.reviewInput.input, '别跑了，换个方式')
+  assert.equal(fb.reviewInput.tool.name, 'execute_command')
+  assert.equal(fb.content, '别跑了，换个方式')
+  // 25b. 正常工具结果轮优先级更高：仍是 reportToolResult，不误判 feedback
+  const rep = toAssistantInput([
+    { role: 'user', content: '帮我看看目录' },
+    { role: 'assistant', content: '', tool_calls: toolCalls },
+    { role: 'tool', tool_call_id: 'call_x_1', content: '文件 A\n文件 B' },
+  ])
+  assert.equal(rep.reviewInput.reviewAction, 'reportToolResult')
+  assert.equal(rep.reviewInput.toolResult.includes('文件 A'), true)
+  // 25c. 上个 assistant 是纯文本（工具循环已闭环）→ 用户文本仍是 start，不进 feedback
+  const start = toAssistantInput([
+    { role: 'assistant', content: '上一轮的回答' },
+    { role: 'user', content: '新问题' },
+  ])
+  assert.equal(start.type, 'start')
+  assert.equal(start.reviewInput, undefined)
+  // 25d. 首轮（无 assistant）不受影响
+  const fresh = toAssistantInput([{ role: 'user', content: '你好' }])
+  assert.equal(fresh.type, 'start')
 }
 
 console.log('smoke 测试全部通过！')
