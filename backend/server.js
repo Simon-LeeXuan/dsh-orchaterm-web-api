@@ -44,7 +44,7 @@ import {
 } from './agent-protocol.js'
 import { redact, resolveCredentials, cookieHeaderFor, decodeJwtExp } from './credentials.js'
 
-export const VERSION = '0.5.1'
+export const VERSION = '0.5.2'
 
 /** 能力自述：插件的 contract.js 按这份清单决定是否复用已起的后端。 */
 export const CAPABILITIES = Object.freeze([
@@ -643,6 +643,9 @@ async function serveChat(config, req, res, payload, round) {
   let reasoning = ''
   let toolCalls = 0
   let terminal = null
+  // 官方 offset 语义（模块 2481：streamChunkOffset.count = 已消费的 data item 数），
+  // 断流续传时作为 /stream/resume 的 offset 上报。
+  let frameCount = 0
 
   // 官方 stop 语义（模块 2481 jt）：客户端停止 = 本地断流 + 通知服务端中止该会话的流。
   // DSH 用户点停止时 provider 会掐断到反代的连接 —— 这里感知「流没走完客户端就走了」，
@@ -883,64 +886,112 @@ async function serveChat(config, req, res, payload, round) {
     }
   }
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
+  /** 单帧处理（主流与续流共用）。 */
+  function processLine(line) {
+    const frame = classifyDataLine(line)
+    if (frame.kind === 'done') { terminal = 'done'; return }
+    if (frame.kind === 'aborted') { terminal = 'aborted'; return }
+    if (frame.kind === 'error') {
+      terminal = 'error'
+      // 流内认证错误（头已发出，本轮没法重试了）：至少刷新凭据，让下一轮拿到新 token。
+      if (AUTH_ERROR_RE.test(frame.message)) config.refreshCredential?.()
+      if (wantStream) send({ error: { message: frame.message, status: 500 } })
+      return
+    }
+    if (frame.kind !== 'data') return
+    // 官方 streamChunkOffset 按全部 data item 计数（onMessage 先 u+=1 再过滤），续流 offset 才能对齐。
+    frameCount += 1
+    const item = frame.item || {}
+
+    // 1) 坚决过滤非 AI 消息（如上游反射的 human 历史消息）
+    if (item.type && item.type !== 'ai') return
+
+    // 2) 遇到上游 Agent 撤销/清空草稿帧，重置未提交的缓冲，防止废弃问候语残留在正文里
+    if (item.id && item.id.startsWith('remove-')) {
+      if (!hasEmittedTarget) {
+        unwrapBuf = ''
+        plainTextFallback = ''
+      }
+      return
+    }
+
+    // 上游代执行工具帧（item.tool）与后端工具结果帧（id 形如 run-*-tool-*，
+    // 官方判据 zV：/^run-.+-tool-.+/，Jt.onMessage 把它的 fullContent 作为 toolResult 回调）。
+    // 都转成可读正文行透出，让「上游在干什么」对用户可见，而不是静默吞掉；
+    // 并跳过解包器 —— 结果原文不是 Agent JSON，喂进去只会污染 finishUnwrap 的兜底缓冲。
+    const isBackendToolResult = typeof item.id === 'string' && /^run-.+-tool-.+/.test(item.id)
+    if (item.tool || isBackendToolResult) {
+      toolCalls += 1
+      const toolName = item.tool?.name || item.tool?.type || 'tool'
+      const toolDesc = typeof item.tool?.description === 'string' ? item.tool.description.slice(0, 120) : ''
+      const category = item.tool ? classifyUiToolCategory(item.tool) : ''
+      const resultSnippet = isBackendToolResult && typeof item.content === 'string' && item.content.trim()
+        ? ` · 结果 ${redactSecrets(item.content).slice(0, 200)}${item.content.length > 200 ? '…' : ''}`
+        : ''
+      const line2 = `\n\n> ⚙️ [上游工具${category ? `/${category}` : ''}] ${toolName}${toolDesc ? ` — ${toolDesc}` : ''}${resultSnippet}\n`
+      pushDelta({ content: line2 })
+      emittedText += line2
+      return
+    }
+
+    // 3) 深度思考
+    if (typeof item.reasoningContent === 'string' && item.reasoningContent !== '') {
+      reasoning += item.reasoningContent
+      pushDelta({ reasoning_content: item.reasoningContent })
+    }
+
+    // 4) 正文增量收集并解包
+    const itemContent = typeof item.content === 'string' ? item.content : (typeof item.text === 'string' ? item.text : '')
+    if (itemContent) {
+      feedUnwrap(itemContent)
+    }
+  }
+
+  /** 泵一个 SSE body 到终止符或流结束（主流与续流共用）。 */
+  async function pumpStream(bodyReader) {
+    for (;;) {
+      const { done, value } = await bodyReader.read()
       if (done) break
       buffer += decoder.decode(value, { stream: true })
       const lines = buffer.split('\n')
       buffer = lines.pop() ?? ''
       for (const line of lines) {
-        const frame = classifyDataLine(line)
-        if (frame.kind === 'done') { terminal = 'done'; break }
-        if (frame.kind === 'aborted') { terminal = 'aborted'; break }
-        if (frame.kind === 'error') {
-          terminal = 'error'
-          // 流内认证错误（头已发出，本轮没法重试了）：至少刷新凭据，让下一轮拿到新 token。
-          if (AUTH_ERROR_RE.test(frame.message)) config.refreshCredential?.()
-          if (wantStream) send({ error: { message: frame.message, status: 500 } })
-          break
-        }
-        if (frame.kind !== 'data') continue
-        const item = frame.item || {}
-
-        // 1) 坚决过滤非 AI 消息（如上游反射的 human 历史消息）
-        if (item.type && item.type !== 'ai') continue
-
-        // 2) 遇到上游 Agent 撤销/清空草稿帧，重置未提交的缓冲，防止废弃问候语残留在正文里
-        if (item.id && item.id.startsWith('remove-')) {
-          if (!hasEmittedTarget) {
-            unwrapBuf = ''
-            plainTextFallback = ''
-          }
-          continue
-        }
-
-        // 上游自己执行的工具帧（如 Agent 跑了命令）：转成可读正文行透出，
-        // 让「上游在干什么」对用户可见，而不是静默吞掉。
-        if (item.tool) {
-          toolCalls += 1
-          const toolName = item.tool.name || item.tool.type || 'tool'
-          const toolDesc = typeof item.tool.description === 'string' ? item.tool.description.slice(0, 120) : ''
-          const line = `\n\n> ⚙️ [上游工具] ${toolName}${toolDesc ? ` — ${toolDesc}` : ''}\n`
-          pushDelta({ content: line })
-          emittedText += line
-        }
-
-        // 3) 深度思考
-        if (typeof item.reasoningContent === 'string' && item.reasoningContent !== '') {
-          reasoning += item.reasoningContent
-          pushDelta({ reasoning_content: item.reasoningContent })
-        }
-
-        // 4) 正文增量收集并解包
-        const itemContent = typeof item.content === 'string' ? item.content : (typeof item.text === 'string' ? item.text : '')
-        if (itemContent) {
-          feedUnwrap(itemContent)
-        }
+        processLine(line)
+        if (terminal) break
       }
       if (terminal) break
     }
+  }
+
+  try {
+    await pumpStream(reader)
+
+    // 官方断流续传（模块 2481 It/Rt）：流异常中断（无 [DONE]/[ERROR]/[ABORTED]、客户端也没走）
+    // 时先查 /stream/status —— 仍 running 就 GET /stream/resume/{cid}?offset=<已收帧数> 续流，
+    // 解包状态机与滤镜全部原样延续，DSH 侧表现为同一条流。官方 Rt 有单次重入护栏，这里同样只续一次。
+    if (terminal === null && !clientGone) {
+      try {
+        const status = await assistantStreamStatus(config, round.conversationId)
+        if (status?.status === 'running') {
+          const resumeUrl = streamControlUrl(config, ASSISTANT_PATHS.streamResume, round.conversationId, { offset: String(frameCount) })
+          const resumed = await fetch(resumeUrl, {
+            method: 'GET',
+            headers: assistantHeaders(config, seqId),
+            signal: AbortSignal.timeout(60000),
+          })
+          const resumeType = resumed.headers.get('content-type') || ''
+          if (resumed.ok && resumeType.includes('event-stream') && resumed.body) {
+            const resumeReader = resumed.body.getReader()
+            try {
+              await pumpStream(resumeReader)
+            } finally {
+              try { await resumeReader.cancel() } catch { /* 已关闭 */ }
+            }
+          }
+        }
+      } catch { /* 续流失败按原样收尾，不向 DSH 抛新错 */ }
+    }
+
     finishUnwrap()
     // 两级滤镜可能还攥着「尚不能判定」的开头，流结束必须放出来，否则正文会缺头。
     flushContent()
@@ -950,6 +1001,12 @@ async function serveChat(config, req, res, payload, round) {
     flushContent()
   } finally {
     try { await reader.cancel() } catch { /* 流已关闭 */ }
+  }
+
+  // 客户端中途掐断连接（DSH 用户点停止）且流没走完：按官方 stop 语义通知上游中止。
+  // fire-and-forget：不能因这次外呼拖住响应收尾；assistantAbort 内部自吞错误。
+  if (clientGone && terminal === null) {
+    void assistantAbort(config, round.conversationId)
   }
 
   // 纯问候语回合：剥离后零正文、零工具调用且未向客户端写过任何字节 ——
@@ -1057,6 +1114,31 @@ export async function startServer(options = {}) {
         if (!cid) return json(res, 400, { ok: false, error: { message: '需要 conversationId 查询参数' } })
         const status = await assistantStreamStatus(config, cid)
         return json(res, 200, { ok: status !== null, conversationId: cid, status })
+      }
+      // 续流直通（官方 Rt）：GET 上游 /stream/resume/{cid}?offset=N，SSE/JSON 原样 pipe 回来。
+      // 主要供排障对照；serveChat 内部的断流续传不经过这里。
+      if (req.method === 'GET' && url.pathname === '/orca/stream-resume') {
+        const cid = String(url.searchParams.get('conversationId') || req.headers['x-orca-conversation-id'] || '')
+        const offset = String(url.searchParams.get('offset') || '0')
+        if (!cid) return json(res, 400, { ok: false, error: { message: '需要 conversationId 查询参数' } })
+        const upstream = await fetch(streamControlUrl(config, ASSISTANT_PATHS.streamResume, cid, { offset }), {
+          method: 'GET',
+          headers: assistantHeaders(config),
+        })
+        res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') || 'application/json' })
+        const reader = upstream.body?.getReader()
+        if (!reader) { res.end(); return }
+        try {
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) break
+            res.write(value)
+          }
+        } finally {
+          try { await reader.cancel() } catch { /* 已关闭 */ }
+          res.end()
+        }
+        return
       }
       // 仅供观察：把将会发出的流控制 URL 暴露出来（不含凭据），便于对照官方抓包。
       if (req.method === 'GET' && url.pathname === '/orca/stream-url') {

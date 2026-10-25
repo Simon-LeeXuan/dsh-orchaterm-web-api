@@ -808,3 +808,33 @@ review 循环 —— 我们此前误发 `start`，上游挂着的 review 得不�
 
 验证：smoke 25 组全绿；feedback 活体重放 2/2（工具调用后用户改口，模型按反馈应答、不重发
 工具）；活体回归 17/17。
+
+
+## 19. 实现丢失事故、找回与断流续传接入（v0.5.2）
+
+### 19.1 事故：v0.5.0 两处实现实际未提交
+核验 git 历史（`git show 7b21e4a:backend/server.js | grep`）发现 v0.5.0 声称的
+「`run-*-tool-*` 帧结构化」「客户端掐断 → 补发 abort」两处 server.js 改动**不在提交里**。
+成因：那轮编辑 server.js 期间连续遇到 "file changed since it was read"，至少两次编辑被
+文件竞争回滚（同时解释了 VERSION 曾显示 0.4.0 的怪象），而 CHANGELOG/WORK_SUMMARY 照常
+写了「已落地」。**教训入册：每个声称落地的行为，提交前必须 `git diff`/grep 对盘确认代码
+真实在位；编辑工具报成功 ≠ 磁盘上真的有。**本轮找回两处，0.5.0 轮的其它改动
+（脱敏/重试/流控制端点/input.id 等）经同法核验均在位。
+
+### 19.2 断流续传接入（`/stream/resume` 待办完结）
+官方 `It/Rt`（模块 2481）：流异常中断 → `GET /stream/status/{cid}` 仍 `running` →
+`GET /stream/resume/{cid}?offset=<streamChunkOffset>` 续流。接入 serveChat：
+- 读循环重构为 `processLine`（单帧）+ `pumpStream`（泵 body），主流与续流共用；
+- `frameCount` 按**全部 data item** 计数（官方口径：onMessage 先 `u+=1` 再过滤）；
+- 触发条件：`terminal === null && !clientGone`（无终止符、客户端没走）；只续一次（对齐
+  官方 `Rt` 的单次重入护栏 `Bt`）；status 非 running 时行为与旧版完全一致；
+- 解包状态机、问候语/重复/标签滤镜、工具信封拦截全部原样延续 —— DSH 侧表现为同一条流；
+- 新增 `/orca/stream-resume?conversationId=&offset=` 直通端点（排障对照）。
+
+### 19.3 验证
+- `npm test` 25 组全绿；活体回归 17/17；`/health` v0.5.2；stderr 空；
+- 续流真机：无凭据探测（回 `NEED_UIN_AND_SKEY`，证明路径被路由到鉴权层）→ 带凭据经
+  `/orca/stream-resume` 对已完成会话请求 → 上游回 `text/event-stream` + `data: [DONE]`
+  （无 running 流则立即终止）—— URL 形态与响应判定都被真实上游接受；
+- 「真断流→续流成功」完整链无法线上稳定复现（需人为掐上游），按真机 URL/响应验证 +
+  与官方同构保证，边界如实入册。

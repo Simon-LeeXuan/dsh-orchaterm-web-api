@@ -1,5 +1,36 @@
 All notable changes to the `dsh-orchaterm-web-api` plugin will be documented in this file.
 
+## [0.5.2] - 2026-10-26
+
+> ⚠️ **先记一次实现丢失事故**：v0.5.0 提交（7b21e4a）声称的「`run-*-tool-*` 帧结构化」与
+> 「客户端掐断 → 补发 abort」两处 server.js 改动**实际不在提交里** —— 编辑期间多次出现
+> "file changed since it was read"，其中两次编辑被文件竞争回滚，而文档照常写了。本轮核验
+> git 历史时发现，已找回并补回。教训：**声称落地的行为必须在提交前用 grep/diff 对过盘**，
+> 不能只看编辑工具报成功。
+
+### Fixed（找回 v0.5.0 丢失的两处实现）
+- `run-*-tool-*` 后端工具结果帧结构化透出（带类别与脱敏摘要、跳过解包器）；
+- DSH 用户点停止 → 感知客户端掐断且流未走完 → fire-and-forget 补发 `/stream/abort/{cid}`。
+
+### Added —— 断流续传接入对话流（`/stream/resume` 待办完结）
+按官方 `It/Rt` 语义（模块 2481）接入 serveChat 主流程：
+- 读循环重构为 `processLine`/`pumpStream`（主流与续流共用），新增 `frameCount` 按**全部 data
+  item** 计数（官方 `streamChunkOffset` 的口径：onMessage 先 `u+=1` 再过滤）；
+- 流异常中断（无 `[DONE]`/`[ERROR]`/`[ABORTED]`、客户端也没走）时先查 `/stream/status` ——
+  仍 `running` 就 `GET /stream/resume/{cid}?offset=<frameCount>` 续流一次，解包状态机与滤镜
+  原样延续，DSH 侧表现为同一条流；官方 `Rt` 有单次重入护栏，这里同样只续一次；
+- 新增 `/orca/stream-resume?conversationId=&offset=` 直通端点（排障对照用）。
+
+### Verified
+- `npm test` 全绿（25 组）；活体回归 **17/17**；`/health` v0.5.2；stderr 空；
+- 续流真机验证：对**已完成会话** `GET /stream/resume/{cid}?offset=0` → 上游回
+  `text/event-stream` + `data: [DONE]`（无 running 流则立即正常终止），证明路径段 cid +
+  offset 查询参数形态被上游真实接受；带凭据探测经 `/orca/stream-resume` 直通端点完成。
+
+### 边界
+- 「上游中途真断流 → 续流成功」的完整触发链无法在线上稳定复现（需人为掐上游连接），
+  由 URL/响应判定的真机验证 + 与官方实现同构保证；status 非 running 时行为与旧版完全一致。
+
 ## [0.5.1] - 2026-10-26
 
 补上 v0.5.0 逆向中发现但未接线的最后一个用户侧通道：**未决 review 的用户文本反馈**。

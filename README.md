@@ -97,11 +97,14 @@ cd C:\AITask\dsh-client-config\plugins\dsh-orchaterm-web-api
 1. **工具结果官方协议（v0.4.0）**：DSH 执行完工具，反代按官方子 Agent 循环的信封回传
    `{type:'review', reviewAction:'reportToolResult', toolResult, tool}`（`tool` 为上游信封原件），
    对照实验证明模型精确消费结果（旧的 `{TOOL_RESULT}` 文本协议时吃时忽略）。
-2. **流控制通道（v0.5.0）**：逆向 `orcaterm_start_core` 模块 2481 后移植 —— 会话 ID 放在路径段：
+2. **流控制通道（v0.5.0/0.5.2）**：逆向 `orcaterm_start_core` 模块 2481 后移植 —— 会话 ID 放在路径段：
    `GET /stream/status/{cid}`、`GET /stream/resume/{cid}?offset=N`、`POST /stream/abort/{cid}`（空体）。
    **DSH 用户点停止时，反代在感知到客户端掐断且上游流未走完的情况下，自动补发
-   `POST /stream/abort/{cid}`**（官方 stop = 本地断流 + 通知服务端，双动作）。管理端点：
-   `POST /orca/stream-abort`、`GET /orca/stream-status?conversationId=`。
+   `POST /stream/abort/{cid}`**（官方 stop = 本地断流 + 通知服务端，双动作）。
+   **上游流异常中断（无终止符）时自动查 status，仍 running 就按 offset 续流**（v0.5.2，
+   官方 Rt 语义，单次护栏；解包与滤镜原样延续，DSH 侧表现为同一条流）。管理端点：
+   `POST /orca/stream-abort`、`GET /orca/stream-status?conversationId=`、
+   `GET /orca/stream-resume?conversationId=&offset=`。
 3. **回传重试官方参数（v0.5.0）**：工具结果轮 `attempts=3`、单次 15s 超时、退避 300→600→1200ms
    （`min(base·2ⁿ, max)`，模块 32804 公式 + @78376 实参）。
 4. **工具结果脱敏（v0.5.0）**：官方客户端回传前必过 `Sn.fp` —— 14 条正则把 PEM 私钥、
