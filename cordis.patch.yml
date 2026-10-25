@@ -1,0 +1,55 @@
+# ============================================================================
+# dsh-orchaterm-web-api —— 把 OrcaTerm (腾讯或壳终端) 反代接入模型选择器
+# ============================================================================
+# 注意：仅作为 provider 路由接入模型选择器，不加入工具列表。
+#
+# 本文件是本插件自带的 bundle patch（package.json 的 dsh.bundle.patch 指向它）。
+#
+# 接入步骤：
+#   1. 执行 .\install.ps1（校验本机 Node.js、验证与 OrcaTerm 桌面端通信）
+#   2. 确认 profile 的 dsh.profile.bundles 里列了 dsh-orchaterm-web-api
+#   3. 重启 DeepSeek Harness 客户端
+# ============================================================================
+
+- insert:
+    - id: dsh-orchaterm-web-api-provider
+      name: dsh-orchaterm-web-api/provider
+      config:
+        # 只允许回环绑定：反代基于本机 OrcaTerm 登录态，对外开放等于泄露凭据
+        baseUrl: 'http://127.0.0.1:8793'
+        backendDir: ''
+        nodePath: ''
+        cgiBase: ''
+        assistantBase: ''
+        assistant: 'orcaterm'
+        mode: 0
+        # 以哪个客户端身份访问上游：'desktop'（origin/referer = http://tauri.localhost，桌面端真实页面）
+        # 或 'web'（https://orcaterm.com）。实测上游两个通道都不校验这些头，这里只是身份对齐。
+        clientIdentity: 'desktop'
+        credentialsFile: ''
+        cookies: ''
+        assistantCookies: ''
+        uin: ''
+        skey: ''
+        autoStart: true
+        startTimeoutMs: 20000
+        probeTimeoutMs: 3000
+        maxContextWindow: 128000
+        defaultMaxTokens: 8192
+        toolDescriptionMaxChars: 0
+        healthTtlMs: 30000
+        streamIdleTimeoutMs: 180000
+        reuseConversation: true
+        # 上游同一会话最多连续多少轮，超过就换新会话并补发 DSH 的历史（0 = 不限制）
+        conversationMaxRounds: 40
+        # 是否把 DSH 多轮历史发给上游：默认 false。上游会把它逐条回灌成 ai 帧污染正文，
+        # 而它凭 conversationId 自己就能保住上下文。仅在对比排障时打开。
+        sendHistoryMessages: false
+        logFile: '~/.dsh/logs/orchaterm-web-api.log'
+        detach: false
+        killTreeOnDispose: true
+        passEnvKeys: []
+        env: {}
+        strictBackend: true
+        requiredCapabilities: []
+        minBackendVersion: ''

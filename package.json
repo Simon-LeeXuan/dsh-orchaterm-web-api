@@ -1,0 +1,46 @@
+{
+  "name": "dsh-orchaterm-web-api",
+  "version": "0.4.0",
+  "description": "OrcaTerm (腾讯云或壳终端) 反代接入 DSH 模型选择器",
+  "type": "module",
+  "main": "lib/provider.js",
+  "exports": {
+    ".": "./lib/provider.js",
+    "./provider": "./lib/provider.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "backend",
+    "cordis.patch.yml",
+    "install.ps1",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/config_check.mjs && node test/smoke.mjs",
+    "test:config": "node test/config_check.mjs",
+    "test:smoke": "node test/smoke.mjs",
+    "test:live": "node test/manual_live.mjs",
+    "test:live:regression": "node test/live_regression.mjs",
+    "install-plugin": "powershell -NoProfile -ExecutionPolicy Bypass -File ./install.ps1"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "orcaterm",
+    "orchaterm",
+    "provider",
+    "llm"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "Apache-2.0"
+}

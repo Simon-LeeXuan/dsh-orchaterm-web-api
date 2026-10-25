@@ -1,0 +1,1020 @@
+/**
+ * OrcaTerm 反代服务（零依赖，Node >= 20）。
+ *
+ * 对外提供 OpenAI 兼容面，供 DSH 的 provider 适配器直连：
+ *   GET  /health              自述版本/能力/凭据状态（不回显任何值）
+ *   GET  /v1/models           CGI DescribeAIModelList + 内建目录 + 用户默认模型
+ *   POST /v1/chat/completions assistant /chat 的 SSE → OpenAI chunk
+ *   POST /orca/cgi            CGI action 透传（工作空间、额度、AI 设置等）
+ *
+ * 只绑 127.0.0.1：本机凭据是从 OrcaTerm 登录态读出来的，暴露到网卡等于把账号交出去。
+ *
+ * @module backend/server.js
+ */
+
+import { createServer } from 'node:http'
+
+import {
+  ASSISTANT_PATHS,
+  assistantBody,
+  assistantHeaders,
+  assistantQuery,
+  cgiCall,
+  classifyDataLine,
+  DESKTOP_IDENTITY,
+  identityOf,
+  newSeqId,
+} from './upstream.js'
+import {
+  createDeliveredHistory,
+  createGreetingStripper,
+  createRepeatStripper,
+  createThinkingTagRouter,
+  describeExecutionHost,
+  parseToolEnvelope,
+  resolveDshToolCall,
+  resolvePosixShell,
+} from './agent-protocol.js'
+import { redact, resolveCredentials, cookieHeaderFor, decodeJwtExp } from './credentials.js'
+
+export const VERSION = '0.4.0'
+
+/** 能力自述：插件的 contract.js 按这份清单决定是否复用已起的后端。 */
+export const CAPABILITIES = Object.freeze([
+  'openai-chat-completions',
+  'orca-cgi-passthrough',
+  'health-self-description',
+  'assistant-sse',
+])
+
+/**
+ * 内建模型目录（精简为 5 个核心模型）：
+ * - DeepSeek-V4.1-Flash: Max/High/Low, 图片识别, 1M 长上下文, 思考模式
+ * - Hy4-preview: High, 1M 长上下文, 思考模式
+ * - Hy3: High/Low, 128K, 思考模式
+ * - Kimi-K3: Max/High/Low, 图片识别, 1M 长上下文, 思考模式
+ * - GLM-5.3-Flash: Max/High/Low, 图片识别, 300K, 思考模式
+ */
+export const BUILTIN_MODELS = Object.freeze([
+  { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', reasoning: true, contextWindow: 1048576, modalities: ['text', 'image'], description: 'OrcaTerm 默认推荐（思考模式 Max/High/Low，图片识别，1M 长上下文）' },
+  { id: 'hy4-preview', name: 'Hy4-preview', reasoning: true, contextWindow: 1048576, modalities: ['text'], description: '腾讯混元新一代预览（思考模式 High，1M 长上下文）' },
+  { id: 'hy3', name: 'Hy3', reasoning: true, contextWindow: 128000, modalities: ['text'], description: '腾讯混元 3 主力模型（思考模式 High/Low，128K）' },
+  { id: 'kimi-k3', name: 'Kimi-K3', reasoning: true, contextWindow: 1048576, modalities: ['text', 'image'], description: '月之暗面 K3（思考模式 Max/High/Low，图片识别，1M 长上下文）' },
+  { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', reasoning: true, contextWindow: 300000, modalities: ['text', 'image'], description: '智谱 GLM 5.3 Flash（思考模式 Max/High/Low，图片识别，300K 长上下文）' },
+])
+
+function json(res, status, payload) {
+  const body = JSON.stringify(payload)
+  // 头已发出（SSE 中途出错）时不能再写状态行，直接终结连接
+  if (res.headersSent) {
+    try { res.end(body) } catch { /* 已终结 */ }
+    return
+  }
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+  })
+  res.end(body)
+}
+
+async function readJson(req) {
+  const chunks = []
+  for await (const chunk of req) chunks.push(chunk)
+  const text = Buffer.concat(chunks).toString('utf8')
+  if (text === '') return {}
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * OpenAI tools 数组 → 上游 Agent 网关的工具声明。
+ * 上游吃 OpenAI function 形态 `{type:'function', function:{name, description, parameters}}`；
+ * 其它类型（内置 tool 类型等）丢弃。数组为空时传 []，不伪造。
+ * @param {unknown} tools
+ * @returns {Array}
+ */
+function toUpstreamTools(tools) {
+  if (!Array.isArray(tools)) return []
+  return tools
+    .filter((t) => t && t.type === 'function' && t.function && typeof t.function.name === 'string')
+    .map((t) => ({
+      type: 'function',
+      function: {
+        name: String(t.function.name),
+        ...(typeof t.function.description === 'string' ? { description: t.function.description } : {}),
+        ...(t.function.parameters && typeof t.function.parameters === 'object' ? { parameters: t.function.parameters } : {}),
+      },
+    }))
+}
+
+/**
+ * OpenAI messages → assistant 的单轮输入。
+ *
+ * 核心设计：
+ * 1. 正常用户提问轮：提取最后一条 user 消息及其系统提示词，转为 type: 'start' 输入；
+ * 2. 工具结果返回轮：当最新消息为 role: 'tool' 时，识别出 DSH 刚刚执行完的工具输出，
+ *    自动封装为 OrcaTerm Agent 协议专用的 `{TOOL_RESULT}(toolName): output` 格式，
+ *    并将 input.type 置为 'ask'，无缝推进上游 Agent 的多轮工具调用状态机。
+ */
+/**
+ * DSH 的 pwsh 工具输出超过 ~50K 字符时会**砍头留尾**，并在结尾留转存文件指针：
+ * `Full formatted result stored at <path>. Use read with offset/limit...`。
+ * 上游 Agent 不认识 DSH 的 read 工具，看到无头截断串会判为「数据不可用」并转而问用户
+ * （session-fb62c7fd 第二次中断的实测链条）。检测到该指针时附上恢复指引，
+ * 教它用自己认识的 execute_command 分段读转存文件，而不是放弃。
+ */
+function appendSpillHint(rawText) {
+  const match = /Full (?:formatted )?(?:result|output) stored at (\S+?)(?:\.\s|\.$|\s)/.exec(rawText)
+  if (!match) return rawText
+  const spillPath = match[1]
+  return `${rawText}\n[系统提示] 上面的输出被截断了（只保留了末尾），完整输出已保存在本机文件 ${spillPath}。`
+    + '不要认为数据缺失或要求用户重新提供；应调用 execute_command 分段读取该文件，例如：'
+    + `Get-Content -LiteralPath '${spillPath}' -TotalCount 100（看开头）、`
+    + `-Tail 100（看结尾）、或 Select-Object -Skip N -First M（看中段），也可以直接在文件上统计（Measure-Object / Select-String）。`
+}
+
+function toAssistantInput(messages) {
+  const list = Array.isArray(messages) ? messages : []
+
+  // 找到最后一个 assistant 消息的索引
+  let lastAssistantIdx = -1
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    if (list[i]?.role === 'assistant') {
+      lastAssistantIdx = i
+      break
+    }
+  }
+
+  const history = []
+  let systemText = ''
+
+  // 1) 历史消息处理：最后一个 assistant 及其前面的所有消息，构成历史轮次
+  for (let i = 0; i <= lastAssistantIdx; i += 1) {
+    const m = list[i]
+    const text = typeof m?.content === 'string'
+      ? m.content
+      : Array.isArray(m?.content)
+        ? m.content.filter((p) => p?.type === 'text').map((p) => p.text || '').join('')
+        : String(m?.content ?? '')
+    if (m.role === 'system' || m.role === 'developer') {
+      if (text) systemText = text
+    } else if (m.role === 'user') {
+      if (text) history.push({ type: 'human', content: text })
+    } else if (m.role === 'assistant') {
+      if (text) {
+        history.push({ type: 'ai', content: text })
+      } else if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+        const tcSummary = m.tool_calls.map((c) => `[调用工具: ${c?.function?.name || 'tool'}]`).join('\n')
+        history.push({ type: 'ai', content: tcSummary })
+      }
+    } else if (m.role === 'tool') {
+      if (text) history.push({ type: 'human', content: `[工具返回结果]: ${text}` })
+    }
+  }
+
+  // 2) 当前回合消息处理：最后一个 assistant 之后的消息
+  const currentParts = []
+  const toolResults = []
+  const reviewTools = []
+  const reviewTexts = []
+  let isToolTurn = false
+
+  for (let i = lastAssistantIdx + 1; i < list.length; i += 1) {
+    const m = list[i]
+    if (m.role === 'tool') {
+      isToolTurn = true
+      const rawText = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '')
+      // 提取被调用的工具名（从前序 assistant 的 tool_calls 里找匹配 tool_call_id）
+      let toolName = 'execute_command'
+      const lastAssMsg = lastAssistantIdx >= 0 ? list[lastAssistantIdx] : null
+      if (Array.isArray(lastAssMsg?.tool_calls)) {
+        const matchedCall = lastAssMsg.tool_calls.find((tc) => tc.id === m.tool_call_id)
+        if (matchedCall?.function?.name) {
+          toolName = matchedCall.function.name
+        }
+      }
+      // 映射回 OrcaTerm 内部工具标签名（仅作日志/兜底用；官方协议回传原样 tool 对象）
+      let orcaTag = toolName
+      if (toolName === 'pwsh' || toolName === 'bash') orcaTag = 'execute_command'
+      else if (toolName === 'read') orcaTag = 'remote_read'
+      else if (toolName === 'write') orcaTag = 'remote_write'
+      else if (toolName === 'glob') orcaTag = 'remote_glob'
+      else if (toolName === 'grep') orcaTag = 'remote_grep'
+      toolResults.push(`{TOOL_RESULT}(${orcaTag}): ${appendSpillHint(rawText)}`)
+      // 官方协议的原样 tool 对象：优先取下发时记住的信封原件，丢档时按映射反推。
+      const lastAssMsg2 = lastAssistantIdx >= 0 ? list[lastAssistantIdx] : null
+      const matched = Array.isArray(lastAssMsg2?.tool_calls)
+        ? lastAssMsg2.tool_calls.find((tc) => tc.id === m.tool_call_id)
+        : null
+      const origTool = ORIG_TOOL_BY_CALL.get(m.tool_call_id)
+        ?? reconstructOrcaTool(matched?.function?.name || toolName, matched?.function?.arguments || '{}')
+      reviewTools.push(origTool)
+      reviewTexts.push(appendSpillHint(rawText))
+    } else {
+      const text = typeof m?.content === 'string'
+        ? m.content
+        : Array.isArray(m?.content)
+          ? m.content.filter((p) => p?.type === 'text').map((p) => p.text || '').join('')
+          : String(m?.content ?? '')
+      if (!text) continue
+      if (m.role === 'system' || m.role === 'developer') {
+        systemText = text
+      } else {
+        currentParts.push(text)
+      }
+    }
+  }
+
+  if (isToolTurn) {
+    // 官方协议（逆向子 Agent 循环实测）：{type:'review', reviewAction:'reportToolResult', toolResult, tool}。
+    // 对照实验：ask+{TOOL_RESULT} 文本会被模型时吃时忽略（"未收到数据"症状根源），此协议精确消费。
+    // 多个结果合并为一份 toolResult（官方客户端逐个回传且等待响应；DSH 一次性给全部，只能合并）。
+    const merged = reviewTexts.length === 1
+      ? reviewTexts[0]
+      : reviewTexts.map((t, i) => `[结果 ${i + 1}/${reviewTexts.length} · ${reviewTools[i]?.name ?? 'tool'}]\n${t}`).join('\n\n')
+    return {
+      content: '',
+      toolResultText: toolResults.join('\n\n'),
+      type: 'review',
+      reviewInput: {
+        type: 'review',
+        reviewAction: 'reportToolResult',
+        toolResult: merged,
+        tool: reviewTools[0] ?? reconstructOrcaTool('pwsh', '{}'),
+      },
+      history,
+    }
+  }
+
+  let content = currentParts.join('\n\n')
+  if (systemText && lastAssistantIdx === -1) {
+    content = `[系统要求] ${systemText}\n\n${content}`
+  }
+
+  return { content, history, type: 'start' }
+}
+
+/** 把 one assistant data item 翻成 OpenAI delta（可能同时有 reasoning 与 content）。 */
+function toDeltas(item) {
+  const deltas = []
+  const reasoning = typeof item?.reasoningContent === 'string' ? item.reasoningContent : ''
+  let content = typeof item?.content === 'string' ? item.content : ''
+  // 上游 completion 动作可能在 taskCompletion 或 text 中返回正文
+  if (content === '' && typeof item?.taskCompletion === 'string') {
+    content = item.taskCompletion
+  } else if (content === '' && typeof item?.text === 'string') {
+    content = item.text
+  }
+  if (reasoning !== '') deltas.push({ reasoning_content: reasoning })
+  if (content !== '') deltas.push({ content })
+  return deltas
+}
+
+class AssistantUnavailableError extends Error {
+  constructor() {
+    super('NEED_UIN_AND_SKEY')
+    this.statusCode = 401
+    this.code = 'assistant_unavailable'
+  }
+}
+
+/**
+ * 建配置对象：CLI/env 覆盖 + 凭据 + cookie 按域拼装。
+ *
+ * `clientIdentity` 决定以哪个客户端的身份访问上游（origin / referer / X-Referer）：
+ * - `desktop`（默认）：`http://tauri.localhost`，即桌面端 webview 的真实页面；
+ * - `web`：`https://orcaterm.com`，即 v0.3.1 及之前的口径。
+ * UA 两种口径都用桌面端实测值（见 upstream.DESKTOP_IDENTITY 的注释）。
+ *
+ * 已实测：`/cgi/api` 与 `/assistant/chat` 都**不校验** origin / referer / UA
+ * （不带、乱填都返回 200 且 ai 帧数一致），所以这里是「对齐真实客户端」而非修故障。
+ *
+ * @param {object} options
+ */
+export function buildConfig(options = {}) {
+  const credentialOpts = {
+    credentialsFile: options.credentialsFile || process.env.DSH_ORCA_CREDENTIALS || '',
+    token: options.token || '',
+    cookies: options.cookies || process.env.ORCA_COOKIES || '',
+    uin: options.uin || '',
+    skey: options.skey || '',
+  }
+  const credential = options.credential || resolveCredentials(credentialOpts)
+  // 显式 cookie 串（assistantCookies）优先于 jar：assistant 只吃 uin/skey 那对。
+  const assistantCookies = options.assistantCookies || process.env.ORCA_ASSISTANT_COOKIES || ''
+  const identityArg = String(options.clientIdentity || process.env.ORCA_CLIENT_IDENTITY || 'desktop').toLowerCase()
+  const clientIdentity = identityArg === 'web' ? 'web' : 'desktop'
+  const identity = identityOf(clientIdentity)
+  const config = {
+    // CGI 控制面默认用**桌面端**的 API host。证据（2026-10-24）：
+    // 桌面端前端 bundle 里硬编码的唯一 API 常量就是 `https://api.orcaterm.cloud.tencent.com`；
+    // 而 `https://api.orcaterm.com` 是**网页版**按 `location.protocol + "//api." + location.host`
+    // 推导出来的（网页端跑在 orcaterm.com 上时即得到该值），在桌面端产物里一次都没出现。
+    // 换回网页版口径：把 cgiBase 设为 https://orcaterm.com，或设 ORCA_CGI_BASE。
+    cgiBase: options.cgiBase || process.env.ORCA_CGI_BASE || 'https://api.orcaterm.cloud.tencent.com',
+    assistantBase: options.assistantBase || process.env.ORCA_ASSISTANT_BASE
+      || 'https://lightai.cloud.tencent.com/assistant',
+    assistant: options.assistant || 'orcaterm',
+    mode: Number(options.mode ?? 0),
+    model: options.model || '',
+    language: options.language || 'zh',
+    enableThinking: options.enableThinking === true,
+    // 客户端身份：origin 与 referer 由 clientIdentity 决定，显式传入的单项仍可覆盖。
+    // 网页版的 X-Referer 是 `parent.location.href`（父页 URL），桌面端主页面就是 tauri.localhost/。
+    clientIdentity,
+    origin: options.origin || process.env.ORCA_ORIGIN || identity.origin,
+    referer: options.referer || process.env.ORCA_REFERER || identity.referer,
+    userAgent: options.userAgent || process.env.ORCA_USER_AGENT || DESKTOP_IDENTITY.userAgent,
+    credential,
+    // cookieFor 读**当时的** credential（不捕获启动时的快照），刷新换新后即可生效。
+    cookieFor: (host) => {
+      if (assistantCookies !== '' && /lightai/.test(host)) return assistantCookies
+      if (config.credential.cookieHeader !== '') return config.credential.cookieHeader
+      return cookieHeaderFor(config.credential.jar, host)
+    },
+    assistantCookies,
+    // 默认不把 DSH 的多轮历史发给上游：上游会把它原样回灌成 ai 帧污染正文，见 upstream.assistantBody。
+    sendHistoryMessages: options.sendHistoryMessages === true || process.env.ORCA_SEND_HISTORY === '1',
+  }
+  // 凭据是桌面端登录态的**快照**：token 只有 ~2h 寿命，桌面端运行中会持续刷新 store。
+  // 历史上多次出现「dsh web 报 Invalid or expired AccessToken、重启反代才恢复」，根因就是它。
+  // ensureFreshCredential 在临期/过期时调用这里重读桌面端登录态（两次文件读）。
+  config.refreshCredential = () => {
+    config.credential = resolveCredentials(credentialOpts)
+    return config.credential
+  }
+  return config
+}
+
+/** 认证类上游错误的判据（用于触发「刷新凭据 + 重试一次」）。 */
+const AUTH_ERROR_RE = /Invalid or expired AccessToken|NEED_UIN_AND_SKEY|VERIFY_USER_FAILED|assistant_unavailable/i
+
+/**
+ * 调用级「原始工具信封」记忆：callId → 上游下发的 tool 对象（type/name/mcpServer/args 原样）。
+ *
+ * 官方协议回传工具结果必须带**原样的 tool 对象**（`reportToolResult` 的 `tool` 字段）；
+ * DSH 侧只有映射后的工具名/参数，这里在下发时把原件存起来，回传时按 tool_call_id 取回。
+ * LRU 有界；进程重启丢失后由 `reconstructOrcaTool` 兜底重建。
+ */
+const ORIG_TOOL_BY_CALL = new Map()
+const ORIG_TOOL_MAX = 512
+function rememberOriginalTool(callId, tool) {
+  if (!callId || !tool) return
+  ORIG_TOOL_BY_CALL.delete(callId)
+  ORIG_TOOL_BY_CALL.set(callId, tool)
+  while (ORIG_TOOL_BY_CALL.size > ORIG_TOOL_MAX) ORIG_TOOL_BY_CALL.delete(ORIG_TOOL_BY_CALL.keys().next().value)
+}
+
+/**
+ * 从 DSH 工具调用反向重建 orca tool 对象（重启丢档时的兜底）。
+ * 与 resolveDshToolCall 的正向映射互逆；包不认识的字段原样带回。
+ */
+function reconstructOrcaTool(dshName, argsText) {
+  let args = {}
+  try { args = JSON.parse(argsText) } catch { /* 保持空对象 */ }
+  const map = {
+    pwsh: () => ({ name: 'execute_command', args: { command: args.command ?? '', ...(args.description ? { description: args.description } : {}) } }),
+    bash: () => ({ name: 'execute_command', args: { command: args.command ?? '' } }),
+    read: () => ({ name: 'remote_read', args: { path: args.file_path ?? '' } }),
+    write: () => ({ name: 'remote_write', args: { path: args.file_path ?? '', content: args.content ?? '' } }),
+    glob: () => ({ name: 'remote_glob', args: { pattern: args.pattern ?? '*' } }),
+    grep: () => ({ name: 'remote_grep', args: { pattern: args.pattern ?? '' } }),
+  }
+  const build = map[dshName]
+  const { name, args: orcaArgs } = build ? build() : { name: dshName, args }
+  return { type: 'mcp', mcpServer: 'mcp-server-orcaterm-oauth', name, args: orcaArgs }
+}
+
+/**
+ * 凭据临期/过期时重读桌面端登录态。
+ *
+ * 判据：token 的 exp 无法解析（=0），或距过期不足 120s。健康时零 IO；
+ * 桌面端没开时重读到的仍是旧值，行为不会更差。
+ *
+ * @param {object} config buildConfig 的产物
+ * @returns {object} 当前应使用的 credential（可能是刚刷新的）
+ */
+export function ensureFreshCredential(config) {
+  if (typeof config.refreshCredential !== 'function') return config.credential
+  const token = config.credential.token || config.credential.assistantBearer || ''
+  const exp = decodeJwtExp(token)
+  if (exp === 0 || exp < Date.now() + 120000) return config.refreshCredential()
+  return config.credential
+}
+
+/** 会话级「已交付正文」记忆：喂给重复剥离器，防同一段正文在下一轮再露一次脸。 */
+const DELIVERED = createDeliveredHistory()
+
+/** 本机 POSIX shell（Git Bash / WSL 等）：用来承接上游按 Linux 主机写出来的命令。 */
+const POSIX_SHELL = resolvePosixShell()
+
+/** 执行环境自述：写进上游提示词，减少模型把命令写成另一个 shell 的语法。 */
+const ENV_PROMPT = describeExecutionHost({ posixShell: POSIX_SHELL })
+
+async function handleModels(config, res) {
+  // token 临期/过期时先重读桌面端登录态，再发 CGI（模型目录拿不到默认项不致命，但没必要白发错凭据）。
+  ensureFreshCredential(config)
+  // 两次 CGI 并发：串行时冷启动要 5s+，会把上层「拿不到就回落静态清单」的超时吃掉。
+  const [byo, setting] = await Promise.all([
+    cgiCall(config, 'DescribeAIModelList', {}),
+    cgiCall(config, 'DescribeUserAiSetting', {}),
+  ])
+  const data = { object: 'list', data: [] }
+  if (byo.ok && Array.isArray(byo.data)) {
+    for (const m of byo.data) {
+      if (!m || typeof m.id !== 'string') continue
+      data.data.push({
+        id: m.id,
+        object: 'model',
+        owned_by: 'orcaterm-byo',
+        name: m.name || m.id,
+        ...(typeof m.provider === 'string' ? { provider: m.provider } : {}),
+      })
+    }
+  }
+  const configuredDefaultId = setting.ok && typeof setting.data?.modelId === 'string' ? setting.data.modelId : ''
+  const defaultId = configuredDefaultId === 'deepseek-v3::deepseek-v4.1-flash'
+    ? 'deepseek-v4.1-flash'
+    : configuredDefaultId
+  for (const m of BUILTIN_MODELS) {
+    data.data.push({
+      id: m.id,
+      object: 'model',
+      owned_by: 'orcaterm-builtin',
+      name: m.name,
+      description: m.description,
+      context_window: m.contextWindow,
+      modalities: m.modalities,
+      ...(m.id === defaultId ? { is_default: true } : {}),
+    })
+  }
+  json(res, 200, data)
+}
+
+async function handleChat(config, req, res) {
+  const payload = await readJson(req)
+  if (payload === null) return json(res, 400, { error: { message: '请求体不是合法 JSON', type: 'invalid_request_error' } })
+
+  // token 临期/过期时先重读桌面端登录态：历史上「Invalid or expired AccessToken」的根源
+  // 就是代理启动后一直揣着过期快照。这里刷新失败也只会走到下面的 assistantReady 检查。
+  ensureFreshCredential(config)
+
+  if (!config.credential.assistantReady) {
+    // 上游会原话回 NEED_UIN_AND_SKEY；提前判定避免一次无效外发。
+    // 这里只报事实，「下一步做什么」归插件的 HINTS —— 两处都写就成了重复文案。
+    return json(res, 401, {
+      error: {
+        message: new AssistantUnavailableError().message,
+        type: 'authentication_error',
+        code: 'assistant_unavailable',
+      },
+    })
+  }
+
+  const { content, history, type, toolResultText, reviewInput } = toAssistantInput(payload.messages)
+  // 本轮是否发历史：默认不发（上游会回灌污染正文）；但调用方做「上下文对账」后判定需要
+  // 补发时（换新会话同步 DSH 的压缩结果）可以逐轮覆盖 —— provider 传 orca_send_history。
+  const sendHistory = config.sendHistoryMessages === true || payload.orca_send_history === true
+  const conversationId = req.headers['x-orca-conversation-id'] || payload.user || `cid-dsh-${newSeqId()}`
+  const wantStream = payload.stream === true
+
+  return serveChat(config, req, res, payload, {
+    content,
+    history,
+    type,
+    toolResultText,
+    reviewInput,
+    sendHistory,
+    conversationId: String(conversationId),
+    wantStream,
+  })
+}
+
+/**
+ * 执行一次上游对话回合并按流式/非流式应答。
+ * @param {object} config
+ * @param {import('node:http').IncomingMessage} req
+ * @param {import('node:http').ServerResponse} res
+ * @param {object} payload 已解析的 OpenAI 请求体
+ * @param {{content:string, history:Array, conversationId:string, wantStream:boolean, type?:string, toolResultText?:string, sendHistory?:boolean, authRetried?:boolean}} round
+ */
+async function serveChat(config, req, res, payload, round) {
+  const { wantStream } = round
+  const content = round.content
+  const body = assistantBody(config, {
+    conversationId: round.conversationId,
+    content,
+    type: round.type,
+    toolResultText: round.toolResultText,
+    reviewInput: round.reviewInput,
+    model: payload.model || config.model,
+    history: round.history,
+    tools: toUpstreamTools(payload.tools),
+    enableThinking: payload.reasoning_effort !== 'none' && payload.reasoning !== false,
+    thinkingLevel: payload.reasoning_effort === 'low' ? 'low' : (payload.reasoning_effort === 'max' ? 'max' : 'high'),
+    envPrompt: ENV_PROMPT,
+    sendHistoryMessages: round.sendHistory === true,
+  })
+  const seqId = newSeqId()
+  const url = assistantQuery(config)
+
+  let upstream
+  let lastFetchErr = null
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      upstream = await fetch(url, {
+        method: 'POST',
+        headers: assistantHeaders(config, seqId),
+        body: JSON.stringify(body),
+        ...(payload._signal ? { signal: payload._signal } : {}),
+      })
+      if (upstream.ok || upstream.status < 500) break
+    } catch (error) {
+      lastFetchErr = error
+      if (attempt < 3) {
+        await new Promise((r) => setTimeout(r, 600))
+        continue
+      }
+    }
+  }
+
+  if (!upstream) {
+    return json(res, 502, { error: { message: `assistant 请求失败: ${lastFetchErr?.message || lastFetchErr}`, type: 'api_error' } })
+  }
+
+  const contentType = upstream.headers.get('content-type') || ''
+  if (!upstream.ok || !contentType.includes('event-stream')) {
+    const raw = await upstream.text().catch(() => '')
+    let message = raw.slice(0, 400)
+    try {
+      const parsed = JSON.parse(raw)
+      message = parsed?.message || parsed?.error?.message || message
+    } catch { /* 原样透出 */ }
+    // 认证类错误（如桌面端刚刷新了 token、我们还在用旧的）：重读登录态重试一次。
+    // 此处响应头还没写过（上面所有分支都走 json()），重入是安全的。
+    if (AUTH_ERROR_RE.test(message) && round.authRetried !== true) {
+      config.refreshCredential?.()
+      return serveChat(config, req, res, payload, { ...round, authRetried: true })
+    }
+    const code = /NEED_UIN_AND_SKEY/i.test(message) ? 'assistant_unavailable' : 'upstream_error'
+    return json(res, code === 'assistant_unavailable' ? 401 : 502, {
+      error: { message, type: code === 'assistant_unavailable' ? 'authentication_error' : 'api_error', code },
+    })
+  }
+
+  const created = Math.floor(Date.now() / 1000)
+  const id = `chatcmpl-orca-${seqId.slice(0, 8)}`
+  const model = payload.model || config.model || 'orcaterm'
+  const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`)
+  const head = (delta, finish = null) => send({
+    id, object: 'chat.completion.chunk', created, model,
+    choices: [{ index: 0, delta, ...(finish ? { finish_reason: finish } : {}) }],
+  })
+
+  // 流式响应头惰性初始化：纯问候语回合要在读完全量后重试，
+  // 提前 writeHead 会让 HTTP 语义不允许第二次 200。
+  let streamStarted = false
+  const beginStream = () => {
+    if (streamStarted || !wantStream) return
+    streamStarted = true
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+      'x-orca-seqid': seqId,
+      'x-orca-conversation-id': round.conversationId,
+    })
+    head({ role: 'assistant' })
+  }
+
+  const reader = upstream.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let reasoning = ''
+  let toolCalls = 0
+  let terminal = null
+
+  const pushDelta = (delta) => { if (wantStream) { beginStream(); head(delta) } }
+
+  // 上游返回的 content 是分片拼接的 Agent 协议 JSON：
+  // 1) 正常回答：{"action":"completion","thinking":"思维链…","taskCompletion":"实际回复内容..."}
+  // 2) 提问工具：{"action":"ask","question":"向用户询问的内容...","options":[...]}
+  // 多字段状态机逐字符解包（thinking→推理流，taskCompletion/question→正文），毫秒级打字机流式，避免 raw JSON 外露。
+  let unwrapState = 'SEEK_KEY'
+  let unwrapBuf = ''
+  let inEscape = false
+  let plainTextFallback = ''
+  let hasEmittedTarget = false
+  let currentField = null
+
+  // ── 问候语剥离 ─────────────────────────────────────────────
+  // LightAI 网关会在每个回合正文前注入产品欢迎语（首轮整条、后续轮作为前缀拼接），
+  // 且随正式内容一起提交（不是 remove- 草稿），只能在输出侧做流式前缀剥离。
+  const greeting = createGreetingStripper()
+
+  // ── <thinking> 标签改道 ───────────────────────────────────
+  // 模型偶尔把思维链同时写进信封 thinking 字段和 taskCompletion 正文里的字面
+  // <thinking> 标签（session-fb62c7fd turn 3 实测）——后者会原样漏进用户可见正文。
+  // 这里把标签块吃掉、内容转成 reasoning 流。
+  const thinkingTag = createThinkingTagRouter({
+    onReasoning: (text) => {
+      reasoning += text
+      pushDelta({ reasoning_content: text })
+    },
+  })
+
+  // ── 重复正文剥离 ───────────────────────────────────────────
+  // 上游会把上一轮的正文（尤其是我们发上去的 historyMessages）原样再吐一遍，
+  // 且下一轮的历史又包含这一段，重复逐轮叠加。这里按会话记住「已经交付过的正文」，
+  // 在新一轮输出开头整段吃掉它 —— 需要重开历史时也不必改上游。
+  const repeat = createRepeatStripper([
+    ...DELIVERED.textsFor(round.conversationId),
+    ...(round.sendHistory === true ? (round.history || []).map((h) => h?.content || '') : []),
+  ])
+
+  // ── 工具信封拦截与 DSH 契约双向适配 ──────────────────────
+  // OrcaTerm Agent 的 MCP 工具调用协议：{"action":"review|execute|...","tool":{type,name,args}}
+  // 拦截后智能映射为 DSH 本机工具契约（如 execute_command -> pwsh/bash，remote_read -> read 等），
+  // 并以标准 OpenAI tool_calls delta 下发，驱动 DSH 本地执行并回传工具结果。
+  const tryToolEnvelope = parseToolEnvelope
+
+  let toolCallSeq = 0
+  const lastToolCalls = []
+  function emitToolCall(obj) {
+    toolCallSeq += 1
+    const rawTool = obj.tool || {}
+    const resolved = resolveDshToolCall(rawTool, payload.tools, { posixShell: POSIX_SHELL })
+    const callObj = {
+      index: toolCallSeq - 1,
+      id: `call_orca_${seqId.slice(0, 8)}_${toolCallSeq}`,
+      type: 'function',
+      function: {
+        name: resolved.name,
+        arguments: typeof resolved.arguments === 'string' ? resolved.arguments : JSON.stringify(resolved.arguments),
+      },
+    }
+    // 记住信封原件：官方协议回传结果要求带原样 tool 对象，按 callId 在回传轮取回。
+    rememberOriginalTool(callObj.id, rawTool)
+    lastToolCalls.push(callObj)
+    toolCalls += 1
+    pushDelta({
+      tool_calls: [callObj],
+    })
+  }
+
+  // 所有正文统一出口（两级）：
+  //   pipeContent —— fenced 工具信封拦截 + 下发（已过全部滤镜的正文才进这里）
+  //   emitContent —— 问候语剥离 → 重复正文剥离 → pipeContent
+  // emittedText：真正下发给客户端的正文（非流式响应用它作 content）。
+  let emittedText = ''
+  function pipeContent(delta) {
+    if (!delta) return
+    emittedText += delta
+    if (delta.includes('```')) {
+      // 贪婪匹配到收尾 ```：工具信封含嵌套对象（args:{...}}），非贪婪会在内层 } 截断
+      const fence = delta.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/)
+      if (fence) {
+        const obj = tryToolEnvelope(fence[1])
+        if (obj) {
+          const before = delta.slice(0, fence.index)
+          if (before.trim()) pushDelta({ content: before })
+          emitToolCall(obj)
+          return
+        }
+      }
+    }
+    pushDelta({ content: delta })
+  }
+
+  function emitContent(delta) {
+    delta = greeting.feed(delta)
+    if (!delta) return
+    delta = repeat.feed(delta)
+    if (!delta) return
+    delta = thinkingTag.feed(delta)
+    if (!delta) return
+    pipeContent(delta)
+  }
+
+  /** 流收尾：先把各级滤镜的滞留缓冲放出来，顺序不能颠倒。 */
+  function flushContent() {
+    const greetTail = greeting.flush()
+    if (greetTail) emitContent(greetTail)
+    // thinkingTag 兜底放行：等不到闭标签的 <thinking> 片段按正文吐出（宁可漏改道不能吞正文）
+    const tagTail = thinkingTag.flush()
+    if (tagTail) pipeContent(tagTail)
+    pipeContent(repeat.flush())
+  }
+
+  function feedUnwrap(chunk) {
+    if (!chunk) return
+    unwrapBuf += chunk
+    plainTextFallback += chunk
+
+    // 多字段循环解包：同一信封里三个字符串字段都要（2026-10-25 实测，deepseek 槽位把思维链
+    // 放在信封的 "thinking" 字段里，而不是 SSE 的 reasoningContent 帧 —— 只认 taskCompletion
+    // 会把整段思维链静默丢掉，dsh web 端就表现为「全程看不到推理」）。
+    // 字段在 JSON 字符串内的引号必为 \"，所以裸 "key" 只可能是真键，扫描安全。
+    for (;;) {
+      if (unwrapState === 'SEEK_KEY') {
+        const targets = [
+          ['"thinking"', 10, 'reasoning'],
+          ['"taskCompletion"', 16, 'content'],
+          ['"question"', 10, 'content'],
+        ]
+        let bestIdx = -1
+        let best = null
+        for (const [needle, len, kind] of targets) {
+          const idx = unwrapBuf.indexOf(needle)
+          if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) {
+            bestIdx = idx
+            best = { len, kind }
+          }
+        }
+        if (!best) break
+        unwrapBuf = unwrapBuf.slice(bestIdx + best.len)
+        currentField = best.kind
+        unwrapState = 'SEEK_VAL'
+      }
+
+      if (unwrapState === 'SEEK_VAL') {
+        const colonIdx = unwrapBuf.indexOf(':')
+        if (colonIdx === -1) break
+        const afterColon = unwrapBuf.slice(colonIdx + 1)
+        const quoteIdx = afterColon.indexOf('"')
+        if (quoteIdx === -1) break
+        unwrapBuf = afterColon.slice(quoteIdx + 1)
+        unwrapState = 'IN_STRING'
+        if (currentField === 'content') hasEmittedTarget = true
+      }
+
+      if (unwrapState === 'IN_STRING') {
+        let delta = ''
+        let i = 0
+        const field = currentField
+        for (; i < unwrapBuf.length; i += 1) {
+          const ch = unwrapBuf[i]
+          if (inEscape) {
+            if (ch === 'n') delta += '\n'
+            else if (ch === '"') delta += '"'
+            else if (ch === '\\') delta += '\\'
+            else if (ch === 't') delta += '\t'
+            else if (ch === 'r') delta += '\r'
+            else delta += ch
+            inEscape = false
+          } else if (ch === '\\') {
+            inEscape = true
+          } else if (ch === '"') {
+            unwrapState = 'SEEK_KEY' // 继续找下一个字段，而不是结束
+            currentField = null
+            i += 1
+            break
+          } else {
+            delta += ch
+          }
+        }
+        unwrapBuf = unwrapBuf.slice(i)
+        if (delta && field) {
+          if (field === 'reasoning') {
+            // 思维链：直接以 reasoning_content 下发（不走正文滤镜——问候语/重复剥离只该管正文），
+            // 非流式时并入 message.reasoning_content。
+            reasoning += delta
+            pushDelta({ reasoning_content: delta })
+          } else {
+            emitContent(delta)
+          }
+        }
+        if (unwrapState !== 'SEEK_KEY') break // 字符串没读完（缓冲耗尽），等下一帧
+      }
+    }
+  }
+
+  function finishUnwrap() {
+    if (!hasEmittedTarget && plainTextFallback.trim()) {
+      // 整包到达时的兜底：优先识别工具信封（action + tool 字段）
+      const toolObj = tryToolEnvelope(plainTextFallback)
+      if (toolObj) {
+        emitToolCall(toolObj)
+        return
+      }
+      let fallbackText = plainTextFallback
+      let fallbackThinking = ''
+      try {
+        const clean = plainTextFallback.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim()
+        const obj = JSON.parse(clean)
+        fallbackText = obj.taskCompletion || obj.question || obj.content || obj.text || plainTextFallback
+        if (typeof obj.thinking === 'string' && obj.thinking !== '') fallbackThinking = obj.thinking
+        if (Array.isArray(obj.options) && obj.options.length > 0) {
+          fallbackText += `\n\n**选项：**\n${obj.options.map((o) => `- ${o}`).join('\n')}`
+        }
+      } catch { /* 非 JSON，原文兜底 */ }
+      if (fallbackThinking) {
+        reasoning += fallbackThinking
+        pushDelta({ reasoning_content: fallbackThinking })
+      }
+      emitContent(fallbackText)
+    } else if (hasEmittedTarget) {
+      // 如果触发了 ask 提问工具且带 options 选项，将选项追加到末尾
+      try {
+        const clean = plainTextFallback.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim()
+        const obj = JSON.parse(clean)
+        if (Array.isArray(obj.options) && obj.options.length > 0) {
+          const optsText = `\n\n**选项：**\n${obj.options.map((o) => `- ${o}`).join('\n')}`
+          pushDelta({ content: optsText })
+          emittedText += optsText
+        }
+      } catch { /* 非 JSON，无 options 追加 */ }
+    }
+  }
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+      for (const line of lines) {
+        const frame = classifyDataLine(line)
+        if (frame.kind === 'done') { terminal = 'done'; break }
+        if (frame.kind === 'aborted') { terminal = 'aborted'; break }
+        if (frame.kind === 'error') {
+          terminal = 'error'
+          // 流内认证错误（头已发出，本轮没法重试了）：至少刷新凭据，让下一轮拿到新 token。
+          if (AUTH_ERROR_RE.test(frame.message)) config.refreshCredential?.()
+          if (wantStream) send({ error: { message: frame.message, status: 500 } })
+          break
+        }
+        if (frame.kind !== 'data') continue
+        const item = frame.item || {}
+
+        // 1) 坚决过滤非 AI 消息（如上游反射的 human 历史消息）
+        if (item.type && item.type !== 'ai') continue
+
+        // 2) 遇到上游 Agent 撤销/清空草稿帧，重置未提交的缓冲，防止废弃问候语残留在正文里
+        if (item.id && item.id.startsWith('remove-')) {
+          if (!hasEmittedTarget) {
+            unwrapBuf = ''
+            plainTextFallback = ''
+          }
+          continue
+        }
+
+        // 上游自己执行的工具帧（如 Agent 跑了命令）：转成可读正文行透出，
+        // 让「上游在干什么」对用户可见，而不是静默吞掉。
+        if (item.tool) {
+          toolCalls += 1
+          const toolName = item.tool.name || item.tool.type || 'tool'
+          const toolDesc = typeof item.tool.description === 'string' ? item.tool.description.slice(0, 120) : ''
+          const line = `\n\n> ⚙️ [上游工具] ${toolName}${toolDesc ? ` — ${toolDesc}` : ''}\n`
+          pushDelta({ content: line })
+          emittedText += line
+        }
+
+        // 3) 深度思考
+        if (typeof item.reasoningContent === 'string' && item.reasoningContent !== '') {
+          reasoning += item.reasoningContent
+          pushDelta({ reasoning_content: item.reasoningContent })
+        }
+
+        // 4) 正文增量收集并解包
+        const itemContent = typeof item.content === 'string' ? item.content : (typeof item.text === 'string' ? item.text : '')
+        if (itemContent) {
+          feedUnwrap(itemContent)
+        }
+      }
+      if (terminal) break
+    }
+    finishUnwrap()
+    // 两级滤镜可能还攥着「尚不能判定」的开头，流结束必须放出来，否则正文会缺头。
+    flushContent()
+  } catch (error) {
+    if (wantStream) send({ error: { message: String(error?.message || error), status: 500 } })
+    terminal = 'error'
+    flushContent()
+  } finally {
+    try { await reader.cancel() } catch { /* 流已关闭 */ }
+  }
+
+  // 纯问候语回合：剥离后零正文、零工具调用且未向客户端写过任何字节 ——
+  // 寒暄就回寒暄，把剥离的问候语原样吐回（不改请求、不重试，仅一次）。
+  if (!streamStarted && emittedText.trim() === '' && reasoning.trim() === '' && toolCalls === 0
+    && (terminal === 'done' || terminal === null)) {
+    const greetingOnly = greeting.clearStripped()
+    if (greetingOnly) {
+      pushDelta({ content: greetingOnly })
+      emittedText = greetingOnly
+    }
+  }
+
+  // 记进会话级「已交付正文」：下一轮开头若原样重放这段，重复剥离器负责吃掉。
+  DELIVERED.remember(round.conversationId, emittedText)
+
+  if (wantStream) {
+    beginStream()
+    const finalReason = terminal === 'aborted' ? 'abort' : (toolCallSeq > 0 ? 'tool_calls' : 'stop')
+    head({}, finalReason)
+    res.write('data: [DONE]\n\n')
+    res.end()
+    return
+  }
+
+  json(res, 200, {
+    id,
+    object: 'chat.completion',
+    created,
+    model,
+    choices: [{
+      index: 0,
+      message: {
+        role: 'assistant',
+        content: emittedText,
+        ...(lastToolCalls.length > 0 ? { tool_calls: lastToolCalls } : {}),
+        ...(reasoning !== '' ? { reasoning_content: reasoning } : {})
+      },
+      finish_reason: toolCallSeq > 0 ? 'tool_calls' : 'stop',
+    }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    orca: { seqId, conversationId: round.conversationId, toolFrames: toolCalls, terminal },
+  })
+}
+
+async function handleCgi(config, req, res) {
+  const payload = await readJson(req)
+  if (payload === null || typeof payload.action !== 'string' || payload.action === '') {
+    return json(res, 400, { ok: false, error: { message: '需要 {action, data?}' } })
+  }
+  const result = await cgiCall(config, payload.action, payload.data ?? {})
+  if (!result.ok) {
+    const status = result.code === 'AUTH' ? 401 : result.code === 'INVALID_REQUEST' ? 400 : 502
+    return json(res, status, { ok: false, ...result })
+  }
+  json(res, 200, { ok: true, action: payload.action, data: result.data })
+}
+
+/**
+ * 起反代服务。
+ * @param {{port?:number, host?:string} & object} options
+ * @returns {Promise<{server:import('node:http').Server, port:number, close:()=>Promise<void>}>}
+ */
+export async function startServer(options = {}) {
+  const config = buildConfig(options)
+  const host = options.host || '127.0.0.1'
+  const port = Number(options.port || 8793)
+
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`)
+    try {
+      if (req.method === 'GET' && url.pathname === '/health') {
+        return json(res, 200, {
+          status: 'ok',
+          version: VERSION,
+          capabilities: CAPABILITIES,
+          cgiBase: config.cgiBase,
+          assistantBase: config.assistantBase,
+          // 当前以哪个客户端身份访问上游（desktop / web），便于确认改动已生效。
+          clientIdentity: config.clientIdentity,
+          credential: redact(config.credential),
+          time: new Date().toISOString(),
+        })
+      }
+      if (req.method === 'GET' && url.pathname === '/v1/models') {
+        return await handleModels(config, res)
+      }
+      if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
+        return await handleChat(config, req, res)
+      }
+      if (req.method === 'POST' && url.pathname === '/orca/cgi') {
+        return await handleCgi(config, req, res)
+      }
+      if (req.method === 'GET' && url.pathname === '/orca/quota') {
+        const result = await cgiCall(config, 'DescribeUserBillingStatus', {})
+        return json(res, result.ok ? 200 : 502, result)
+      }
+      return json(res, 404, { error: { message: `no route ${req.method} ${url.pathname}`, type: 'invalid_request_error' } })
+    } catch (error) {
+      // 流式响应可能已 writeHead，此时只能终结 SSE 而不能再写 JSON 状态行
+      if (res.headersSent) {
+        try { res.end() } catch { /* 已终结 */ }
+        return
+      }
+      return json(res, 500, { error: { message: String(error?.message || error), type: 'api_error' } })
+    }
+  })
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(port, host, resolve)
+  })
+  const actual = server.address()
+  return {
+    server,
+    port: actual.port,
+    close: () => new Promise((resolve) => { server.closeAllConnections?.(); server.close(resolve) }),
+  }
+}
+
+export { ASSISTANT_PATHS }
