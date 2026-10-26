@@ -119,13 +119,33 @@ cd C:\AITask\dsh-client-config\plugins\dsh-orchaterm-web-api
 7. **未决 review 的用户反馈通道（v0.5.1）**：模型发过工具调用而 DSH 未回工具结果、用户直接
    打字改口时，反代按官方 `ut` 语义发 `{reviewAction:'feedback', input, tool}` 续进同一 review
    循环（而非误开新 `start`，让上游挂着的 review 悬空）。
+8. **提问信封 → DSH 提问弹窗（v0.5.3）**：上游的 `{action:'ask',question,options}` 原本只被
+   翻成「正文 + `**选项：**` 清单」，用户只能自由打字。现在当调用方声明了 `ask_user_question`
+   时，反代**额外下发一个真的 `ask_user_question` 工具调用**（信封的 `options` → DSH 弹窗选项），
+   于是 dsh web 用原生提问卡片接管；用户提交的答复按官方 `respondToAsk`（模块 2481 `at`）以
+   `{type:'ask', input:<答复原文>}` 回传，上游据此继续。问题正文照常流式可见（不牺牲打字机）。
+
+### 工具结果回传的两种官方形态（v0.5.3 补齐并实测）
+
+桌面 bundle 里**两处**都叫 reportToolResult，但信封不同；v0.5.3 把两者都实现，用
+`resultEnvelope` 选（默认 `review`），并逐轮可用请求体 `orca_result_envelope` 覆盖：
+
+| 形态 | 信封 | 逆向出处 |
+| --- | --- | --- |
+| `review`（默认） | `{type:'review', reviewAction:'reportToolResult', toolResult, tool}` | 桌面端**唯一在消费**的回传路径：子 Agent 循环，`orcaterm_start.js`/`orcaterm_app.js`（各 4 处调用点） |
+| `ask` | `{type:'ask', input:'{TOOL_RESULT}(<tool.name>): <result>'}` | 主循环模块 2481 导出的 `reportToolResult`（`st`）+ 标签常量 `TOOL_RESULT`（模块 68280）；入站正则在模块 73383 |
+
+默认取 `review` 的依据：本插件 `clientIdentity='desktop'`，而桌面两个 bundle 里只有子 Agent 循环
+在**消费**这种回传（模块 2481 那套在主包里没有调用点，属导出 API）。**两种形态都经真实流量
+A/B 验证能被上游正确消费**（同样问句下都能从结果里读出 `orchaterm-tool-probe` 并给出正确结论），
+所以这是「哪个更贴官方」的选择，不是「哪个能用」的选择。
 
 ---
 
 ## 验证
 
 ```powershell
-npm test                       # 离线：cordis/DEFAULTS 静态校验 + 24 组 smoke（消息转换、剥离、判定、路由、映射、身份、脱敏、流控制）
+npm test                       # 离线：cordis/DEFAULTS 静态校验 + 27 组 smoke（消息转换、剥离、判定、路由、映射、身份、脱敏、流控制、提问信封、畸形兜底）
 npm run test:live:regression   # 活体：需反代在跑 + 有效登录态，17 项断言，会让模型真发工具调用
 # 凭据说明（v0.3.3）：token 临期/过期时反代自动重读 OrcaTerm 桌面端登录态，并在认证失败时自动重试一次；
 # 只要桌面端开着就不用再手动重启反代。桌面端没开且 token 过期时报 AUTH 属预期。

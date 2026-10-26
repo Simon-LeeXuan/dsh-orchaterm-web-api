@@ -951,3 +951,135 @@ export function reportRetryBackoffMs(attempt, options = {}) {
 
 /** 官方回传超时：单次尝试 15s（`回传工具结果` 操作的 timeoutMs）。 */
 export const REPORT_RETRY_TIMEOUT_MS = 15000
+
+// ─────────────────────────────────────────────────────────────
+// 9. ask 提问信封 ⇄ DSH ask_user_question（双向适配）
+// ─────────────────────────────────────────────────────────────
+//
+// 上游 Agent 的提问信封（桌面 bundle 里 `C.sX({action:'ask',question,options})`）：
+//   {"action":"ask","thinking":"…","question":"向用户询问的内容…","options":["A","B"]}
+// 官方客户端为它开的是**带选项的提问对话框**（所以信封里才带 options），不是一段正文。
+// 而 DSH 侧对应的正是 ask_user_question 工具（`packages/interaction/tool-ask-user`）：
+//   参数 {questions:[{id,question,header?,options?:[{label,description?}],multi_select?}]}
+//   结果 {answers:[{id,selected:[...],custom?}]}（render 成 JSON 文本）
+// 这里做双向翻译，让 DSH 的提问弹窗接管 OrcaTerm 的提问。
+//
+// 回程形态取自桌面 bundle 模块 2481：
+//   respondToAsk(input)            → {type:'ask', input:<用户答复原文>}
+//   reportToolResult(result, tool) → {type:'ask', input:'{TOOL_RESULT}(<tool.name>): <result>'}
+// 两者都走 `type:'ask'`；工具名标签常量 ASSISTANT_TOOL_RESULT_MSG_TAG = 'TOOL_RESULT'（模块 68280）。
+
+/** DSH ask_user_question 工具名（与 packages/interaction/tool-ask-user 一致）。 */
+export const ASK_TOOL_NAME = 'ask_user_question'
+
+/** 一次提问信封最多保留的选项数（上游偶尔吐很长的候选列表，弹窗塞不下）。 */
+const ASK_MAX_OPTIONS = 12
+
+/**
+ * 一个上游选项 → DSH 选项对象。
+ * 上游实测两种形态：纯字符串（`["当前目录","临时目录"]`）与对象（`{label,description}`）；
+ * 对象形态再兜 label/name/title/value 几个常见键，取不到就整体转字符串。
+ * @param {unknown} option
+ * @returns {{label:string, description?:string}|null}
+ */
+export function toDshOption(option) {
+  if (typeof option === 'string') {
+    const label = option.trim()
+    return label === '' ? null : { label }
+  }
+  if (option && typeof option === 'object') {
+    const raw = option.label ?? option.name ?? option.title ?? option.value ?? option.text
+    const label = typeof raw === 'string' ? raw.trim() : ''
+    if (label === '') return null
+    const description = typeof option.description === 'string' && option.description.trim() !== ''
+      ? option.description.trim()
+      : undefined
+    return description === undefined ? { label } : { label, description }
+  }
+  return null
+}
+
+/**
+ * 上游 ask 信封 → DSH ask_user_question 参数。
+ *
+ * `id` 由我们生成：上游信封不带 id，而 DSH 的答案要按 id 回指。
+ * 多个问题合并在同一信封里的情况上游没见过（信封只有一个 question 字段），
+ * 所以这里恒定产出单问题批次，与信封语义一一对应。
+ *
+ * @param {{question?:string, options?:unknown[], multiSelect?:boolean, header?:string}} envelope
+ * @param {{idPrefix?:string}} [options]
+ * @returns {{questions:Array}|null} 信封里没有可用 question 时返回 null
+ */
+export function askEnvelopeToQuestionTool(envelope, options = {}) {
+  const question = typeof envelope?.question === 'string' ? envelope.question.trim() : ''
+  if (question === '') return null
+  const items = Array.isArray(envelope.options) ? envelope.options : []
+  const mapped = items.map(toDshOption).filter(Boolean).slice(0, ASK_MAX_OPTIONS)
+  const header = typeof envelope.header === 'string' && envelope.header.trim() !== ''
+    ? envelope.header.trim()
+    : undefined
+  const question0 = {
+    id: String(options.idPrefix || 'orca-q1'),
+    question,
+    ...(header === undefined ? {} : { header }),
+    ...(mapped.length === 0 ? {} : { options: mapped }),
+    // 信封里若显式给了多选语义就透传；否则单选（官方选项列表默认单选）。
+    ...(envelope.multiSelect === true ? { multi_select: true } : {}),
+  }
+  return { questions: [question0] }
+}
+
+/**
+ * DSH ask_user_question 的工具结果 → 回给上游的答复正文。
+ *
+ * 形态对齐官方 respondToAsk：`{type:'ask', input:<文本>}`，input 是**人读的答复**。
+ * 答复文本按「选中项 + 自定义输入」拼装，与 DSH 自己的 `replyClipboardText` 语义一致；
+ * 全程没答（跳过）时给一句明确的「用户跳过」而不是空串 —— 空串会被上游当成没答复。
+ *
+ * @param {string} rawResult DSH 回传的工具结果文本（JSON `{answers:[…]}`，可能是 `{pending:true}`）
+ * @returns {string} 非空的人类可读答复
+ */
+export function askResultToAnswerText(rawResult) {
+  const SKIPPED = '（用户跳过了这个问题，没有给出答复）'
+  const text = String(rawResult ?? '').trim()
+  if (text === '') return SKIPPED
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    // 不是 JSON：DSH 工具报错等情况，原文就是答复内容。
+    return text
+  }
+  if (!parsed || typeof parsed !== 'object') return text
+  if (parsed.pending === true) return SKIPPED
+  const answers = Array.isArray(parsed.answers) ? parsed.answers : null
+  if (answers === null) return text
+  const parts = []
+  for (const answer of answers) {
+    const selected = Array.isArray(answer?.selected)
+      ? answer.selected.filter((item) => typeof item === 'string' && item.trim() !== '')
+      : []
+    const custom = typeof answer?.custom === 'string' ? answer.custom.trim() : ''
+    const values = [...selected, ...(custom === '' ? [] : [custom])]
+    if (values.length > 0) parts.push(values.join('、'))
+  }
+  return parts.length === 0 ? SKIPPED : parts.join('；')
+}
+
+/**
+ * 官方 reportToolResult 的 input 文本（模块 2481 `st` + 模块 73383 `b`/`v`）：
+ *   '{TOOL_RESULT}' + '(' + tool.name + '): ' + result
+ * `(<name>)` 只在有工具名时出现（官方 `v` 的 `names.length ? … : ''`）。
+ * 名字字符集受官方入站正则约束（模块 73383 `y`）：`[a-z0-9_-]+`。
+ *
+ * @param {string} toolName 上游 tool 对象的 name（原样，不做 DSH 名映射）
+ * @param {string} result 工具结果文本
+ * @returns {string}
+ */
+export function wrapToolResultInput(toolName, result) {
+  const name = String(toolName ?? '').trim()
+  const tag = name !== '' && /^[a-z0-9_-]+$/i.test(name)
+    ? `{TOOL_RESULT}(${name}): `
+    : '{TOOL_RESULT}: '
+  return `${tag}${String(result ?? '')}`
+}

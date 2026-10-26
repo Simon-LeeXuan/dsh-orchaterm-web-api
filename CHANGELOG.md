@@ -1,5 +1,55 @@
 All notable changes to the `dsh-orchaterm-web-api` plugin will be documented in this file.
 
+## [0.5.3] - 2026-10-27
+
+把「上游提问」接成 DSH 的原生提问弹窗，并补上第二种官方工具结果信封；两者都经**真实 dsh web
+会话**验证（不是只跑离线断言）。
+
+### Added —— 提问信封 → `ask_user_question` 弹窗（双向）
+- 上游 `{action:'ask',question,options}` 此前只被翻成「正文 + `**选项：**` 清单」，用户只能自由
+  打字。现在调用方声明了 `ask_user_question` 时，反代**额外下发一个真的工具调用**
+  （`askEnvelopeToQuestionTool`：信封 `options` → DSH 弹窗选项；`header`/`multiSelect` 透传；
+  选项上限 12 条；字符串/对象两种选项形态都吃）。正文照常流式可见，不牺牲打字机。
+- 答复回程按官方 `respondToAsk`（模块 2481 `at`）：`{type:'ask', input:<答复原文>}`，
+  由 `askResultToAnswerText` 把 DSH 的 `{answers:[{id,selected,custom}]}` 拼成人读文本；
+  跳过/未决/非 JSON 一律给明确文本，不回空串（空串会被上游当成「没答复」）。
+- 没声明该工具时行为完全不变（退回正文 + 选项清单），不会下发宿主执行不了的工具名。
+
+### Added —— 第二种官方工具结果信封
+- `resultEnvelope`：`'review'`（默认）| `'ask'`。前者是桌面子 Agent 循环的形态（桌面 bundle 里
+  **唯一在消费**的回传路径），后者是主循环模块 2481 导出 `reportToolResult`（`st`）的形态
+  `{type:'ask', input:'{TOOL_RESULT}(<tool.name>): <result>'}`（标签常量见模块 68280、
+  入站正则见模块 73383，由新增 `wrapToolResultInput` 按同样的 `[a-z0-9_-]+` 约束生成）。
+- 支持逐轮覆盖 `orca_result_envelope`（live A/B 用，不必重启后端），并贯通到
+  `lib/config.js` 的 `DEFAULTS`/`MANAGER_KEYS`、`cordis.patch.yml` 与 provider 的 env 下发。
+
+### Changed
+- `toAssistantInput(messages, options)` 新增可选第二参（`resultEnvelope` / `askCallIds`），
+  旧调用方式与旧行为不变；提问答复优先于工具结果信封判定。
+- `ORIG_TOOL_BY_CALL` 之外新增同寿命的 `ORCA_ASK_BY_CALL`：提问信封没有 `tool` 对象、
+  回程也不走 `reportToolResult`，光靠前者分不出两种回传。
+
+### Verified
+- **真实 dsh web 会话（OrcaTerm DeepSeek-V4.1-Flash）端到端 4 步全绿**，会话日志逐事件核对：
+  ① `tool/call ask_user_question`（`call_orca_ask_fa5a451a_1`，3 个选项）→ 在弹窗里选中第 1 项
+  提交 → `tool/result {"answers":[{"id":"orca-q-fa5a451a","selected":["验证所有工具是否正常工作…"]}]}`；
+  ② `tool/call pwsh` → `tool/result orchaterm-tool-probe`（真 stdout）；
+  ③ `tool/call pwsh`（模型自己选 `Get-Content | ConvertFrom-Json`，没用 read）→
+  `tool/result 0.5.2`；④ 收尾总结。说明工具调用识别、结果回传、弹窗问答三条链路都通。
+- **工具结果信封 live A/B**：同一问句下 `review` 与 `ask` 两种形态都被上游正确消费
+  （均读出 `orchaterm-tool-probe` 并给出正确结论）—— 所以默认值的选择依据是「哪个更贴官方」。
+- `npm test` 全绿（smoke 25 → **27 组**：新增提问信封双向适配、以及**畸形结构化指令兜底**
+  —— 畸形选项/超长选项/非字符串 question/畸形答复/丢档反推/坏 JSON 参数/混批/优先级）；
+  活体回归 **17/17**；`/health` v0.5.3。
+
+### 边界
+- 提问信封只承载单个 `question` 字段，故恒定产出单问题批次；上游若把多问题塞进同一信封
+  （未见过），会退化成「一个弹窗问合并后的问题」，不会丢内容。
+- 混批（同一轮既有提问又有真工具结果）整批走工具结果信封，与官方「逐个回传」不同 ——
+  DSH 一次给全部结果，只能取其一；已在 smoke 27m 锁定该行为。
+- 「上游 ask 信封 → 弹窗」在调用方未声明 `ask_user_question` 时**不会**生效，这是刻意的
+  降级而不是缺陷（避免下发不存在的工具名）。
+
 ## [0.5.2] - 2026-10-26
 
 > ⚠️ **先记一次实现丢失事故**：v0.5.0 提交（7b21e4a）声称的「`run-*-tool-*` 帧结构化」与

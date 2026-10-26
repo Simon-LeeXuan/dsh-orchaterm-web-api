@@ -45,6 +45,9 @@
         # 是否把 DSH 多轮历史发给上游：默认 false。上游会把它逐条回灌成 ai 帧污染正文，
         # 而它凭 conversationId 自己就能保住上下文。仅在对比排障时打开。
         sendHistoryMessages: false
+        # 工具结果回传信封：'review'（默认，桌面端在用的形态）| 'ask'（主循环模块 2481 的形态）。
+        # 两种都经真实流量验证能被上游消费；逐轮可用请求体 orca_result_envelope 覆盖。
+        resultEnvelope: 'review'
         logFile: '~/.dsh/logs/orchaterm-web-api.log'
         detach: false
         killTreeOnDispose: true

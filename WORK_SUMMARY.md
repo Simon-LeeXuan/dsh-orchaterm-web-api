@@ -838,3 +838,84 @@ review 循环 —— 我们此前误发 `start`，上游挂着的 review 得不�
   （无 running 流则立即终止）—— URL 形态与响应判定都被真实上游接受；
 - 「真断流→续流成功」完整链无法线上稳定复现（需人为掐上游），按真机 URL/响应验证 +
   与官方同构保证，边界如实入册。
+
+---
+
+## 20. 提问链路接进 DSH 弹窗 + 第二种官方结果信封（v0.5.3）
+
+### 20.1 起点：一次真实会话把两个缺口照出来
+用户在 dsh web 里用 OrcaTerm 槽位跑真实会话，第一次直接失败：
+`orchaterm-web-api 错误: Invalid or expired AccessToken`（`SERVER`，回合 Failed，重试 2/2 后放弃）。
+排查结论**不是代码缺陷**：`%APPDATA%\com.orcaterm-desktop.app\data.bin` 里的 `oauth_access_token`
+早在 13:25:26Z 就过期，而 OrcaTerm 桌面端自 20:28 重启机器后一直没启动 ——
+`handleChat` 确实在发请求前调了 `ensureFreshCredential`（server.js:498），但桌面端没开，
+重读到的还是同一个过期值。启动 OrcaTerm 后 store 立即刷新（新 exp 17:20→18:40），会话恢复正常。
+**结论入册：这个报错的第一诊断动作是先看 OrcaTerm 桌面端是否在跑，不是重启反代。**
+
+### 20.2 缺口一：提问信封只落成一段正文
+live 探针（直打 `127.0.0.1:8793/v1/chat/completions`，声明 `pwsh`/`read`/`ask_user_question`）：
+上游回过 `{action:'ask',question,options}`，反代只产出
+`请问您想清理哪个目录？…**选项：** - 当前工作目录（.） - 用户临时文件夹…` ——
+**没有工具调用、没有弹窗**，用户只能自由打字。而官方客户端为提问开的是带选项的对话框
+（信封里带 `options` 正是为此），DSH 侧对应的就是 `ask_user_question`
+（`packages/interaction/tool-ask-user`，参数 `{questions:[{id,question,header?,options?,multi_select?}]}`，
+结果 `{answers:[{id,selected,custom?}]}`）。
+
+回程形态取自模块 2481：
+```
+at = (e,t,n,r) => et({type: y.tw.ASK, input: e}, …)                    // respondToAsk
+st = (e,t)     => et({type: y.tw.ASK, input: $v(tool.name)(…, e)}, …)   // reportToolResult
+```
+即 **答复提问 = `{type:'ask', input:<用户答复原文>}`**，与「回传工具结果」不是同一个 input。
+
+### 20.3 缺口二：工具结果信封只实现了两种官方形态里的一种
+模块 2481 导出的 `reportToolResult`（`st`）发的其实是
+`{type:'ask', input:'{TOOL_RESULT}(<tool.name>): <result>'}`（标签常量 `TOOL_RESULT`，
+模块 68280；包装器见模块 73383 的 `v`/`b`，入站正则在同模块的 `y`）。
+而 v0.4.0 起本插件一直发的是 `{type:'review',reviewAction:'reportToolResult',toolResult,tool}` ——
+那是**桌面端两个 bundle 里唯一在消费**的形态（子 Agent 循环，`orcaterm_start.js`/`orcaterm_app.js`
+各 4 处调用点）。两者都官方，取舍见 20.5。
+
+### 20.4 实现
+- `askEnvelopeToQuestionTool` / `toDshOption` / `askResultToAnswerText` / `wrapToolResultInput`
+  落在 `agent-protocol.js`（纯函数，全部进 smoke）；
+- `server.js`：`finishUnwrap` 两个分支都识别 `action:'ask'` → `emitAskToolCall`；
+  仅当调用方声明了 `ask_user_question` 才下发工具调用，否则行为不变（退回正文+清单）；
+  新增同寿命 `ORCA_ASK_BY_CALL` 标记提问 callId，`toAssistantInput` 据此把该 callId 的结果
+  走 `respondToAsk` 而不是 `reportToolResult`；
+- `toAssistantInput(messages, options)` 新增 `resultEnvelope`/`askCallIds`（旧调用不变）；
+- `resultEnvelope` 贯通 `DEFAULTS`/`MANAGER_KEYS`/`cordis.patch.yml`/provider env 下发，
+  并支持逐轮请求体 `orca_result_envelope` 覆盖。
+
+### 20.5 验证
+- **真实 dsh web 会话端到端（OrcaTerm DeepSeek-V4.1-Flash，4 步）**，会话日志逐事件核对
+  （`session-780aee1a/session.v4.jsonl.zstd`，注意该文件是**多帧拼接** zstd，需按帧解）：
+  | 步 | 事件 | 内容 |
+  | --- | --- | --- |
+  | 1 | `tool/call ask_user_question` `call_orca_ask_fa5a451a_1` | 3 个选项（信封 options 原样进弹窗） |
+  | 1 | `tool/result` | `{"answers":[{"id":"orca-q-fa5a451a","selected":["验证所有工具是否正常工作…"]}]}` |
+  | 2 | `tool/call pwsh` `call_orca_47dbc8f0_1` | `echo orchaterm-tool-probe` |
+  | 2 | `tool/result` | `orchaterm-tool-probe`（真 stdout） |
+  | 3 | `tool/call pwsh` `call_orca_4dc55075_1` | 模型自己选 `Get-Content … \| ConvertFrom-Json`（没用 `read`） |
+  | 3 | `tool/result` | `0.5.2`（读到了 version） |
+  弹窗是在 dsh web UI 里真实点选并 Submit 的 —— 回答经 `respondToAsk` 回到上游后，模型明确
+  复述了所选选项并继续下一步，证明「弹窗选项 → 上游理解」这段是通的。
+- **工具结果信封 live A/B**：同一问句下 `review` 与 `ask` 两种形态**都被正确消费**
+  （都读出 `orchaterm-tool-probe` 并给出正确结论）。默认取 `review` 的依据是「桌面 bundle 里
+  只有它在消费」，不是「另一个不能用」—— 这点与 v0.4.0 轮「ask 时吃时忽略」的旧结论不同，
+  旧结论很可能源于当时的包装文本/工具名不对，已按新证据更正。
+- `npm test` 27 组全绿（新增 26 提问信封双向、27 畸形结构化指令兜底：畸形/超长选项、
+  非字符串 question、畸形答复、丢档反推、坏 JSON 参数、混批、优先级）；活体回归 17/17；
+  `/health` v0.5.3。
+
+### 20.6 关于「结构化指令可能存在缺陷」的兜底清单
+用户点名的风险按层落到这些守卫上（每条都有断言）：
+1. 信封整包畸形 → `parseToolEnvelope` 返 null，正文原文兜底；
+2. 围栏内嵌套对象 → `pipeContent` 用贪婪 `\{[\s\S]*\}`（非贪婪会在内层 `}` 截断）；
+3. `action:'ask'` 但 question 不是字符串/为空 → 不产工具调用，退回正文+清单；
+4. `options` 混进 null/数字/空串/缺 label 对象 → 逐个丢弃，不产空 label；
+5. `options` 超长 → 截到 12 条，弹窗不被撑爆；
+6. 答复不是 JSON / 是 `{pending:true}` / selected 全空 → 给「用户跳过」明确文本，不回空串；
+7. 工具名带非法字符 → 退化成无 `(name)` 的 `{TOOL_RESULT}: `，不违反官方入站正则；
+8. LRU 丢档（进程重启）→ `reconstructOrcaTool` 反推；参数坏 JSON → 退化成原样 args 不抛；
+9. 混批（提问+真工具结果）→ 整批走工具结果信封（DSH 一次给全部，只能取其一）。

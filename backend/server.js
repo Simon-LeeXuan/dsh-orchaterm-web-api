@@ -41,10 +41,14 @@ import {
   reportRetryBackoffMs,
   resolveDshToolCall,
   resolvePosixShell,
+  askEnvelopeToQuestionTool,
+  askResultToAnswerText,
+  ASK_TOOL_NAME,
+  wrapToolResultInput,
 } from './agent-protocol.js'
 import { redact, resolveCredentials, cookieHeaderFor, decodeJwtExp } from './credentials.js'
 
-export const VERSION = '0.5.2'
+export const VERSION = '0.5.3'
 
 /** 能力自述：插件的 contract.js 按这份清单决定是否复用已起的后端。 */
 export const CAPABILITIES = Object.freeze([
@@ -143,9 +147,19 @@ function appendSpillHint(rawText) {
     + `-Tail 100（看结尾）、或 Select-Object -Skip N -First M（看中段），也可以直接在文件上统计（Measure-Object / Select-String）。`
 }
 
-/** OpenAI messages → assistant 单轮输入（导出供单测；行为见内注）。 */
-export function toAssistantInput(messages) {
+/**
+ * OpenAI messages → assistant 单轮输入（导出供单测；行为见内注）。
+ *
+ * @param {Array} messages OpenAI 形态消息数组
+ * @param {{resultEnvelope?:'review'|'ask', askCallIds?:Set<string>}} [options]
+ *   `resultEnvelope` 选工具结果的回传信封：`'review'`（默认，官方子 Agent 循环形态）
+ *   或 `'ask'`（官方主循环 `reportToolResult` 形态）；两者都以真实流量验证过，见 README。
+ *   `askCallIds` 是「这些 callId 是上游提问信封」的集合 —— 它们的回传走 respondToAsk。
+ */
+export function toAssistantInput(messages, options = {}) {
   const list = Array.isArray(messages) ? messages : []
+  const resultEnvelope = options.resultEnvelope === 'ask' ? 'ask' : 'review'
+  const askCallIds = options.askCallIds instanceof Set ? options.askCallIds : null
 
   // 找到最后一个 assistant 消息的索引
   let lastAssistantIdx = -1
@@ -188,6 +202,8 @@ export function toAssistantInput(messages) {
   const toolResults = []
   const reviewTools = []
   const reviewTexts = []
+  // 每个工具结果的一条记录：回传信封按整批决定，所以要先把事实收齐再选形态。
+  const results = []
   let isToolTurn = false
 
   for (let i = lastAssistantIdx + 1; i < list.length; i += 1) {
@@ -222,6 +238,12 @@ export function toAssistantInput(messages) {
       reviewTools.push(origTool)
       // 官方客户端回传前先用 Sn.fp 脱敏（模块 35482 → redactSecrets），转存指引在其后追加。
       reviewTexts.push(appendSpillHint(redactSecrets(rawText)))
+      results.push({
+        rawText,
+        orcaTag,
+        origTool,
+        isAsk: askCallIds !== null && askCallIds.has(String(m.tool_call_id ?? '')),
+      })
     } else {
       const text = typeof m?.content === 'string'
         ? m.content
@@ -238,8 +260,27 @@ export function toAssistantInput(messages) {
   }
 
   if (isToolTurn) {
-    // 官方协议（逆向子 Agent 循环实测）：{type:'review', reviewAction:'reportToolResult', toolResult, tool}。
-    // 对照实验：ask+{TOOL_RESULT} 文本会被模型时吃时忽略（"未收到数据"症状根源），此协议精确消费。
+    // 上游的**提问**不是工具执行结果，回程要用官方 respondToAsk（模块 2481 `at`）：
+    // `{type:'ask', input:<用户答复原文>}`。整批都是提问时才走这条；混批按工具结果处理。
+    if (results.length > 0 && results.every((r) => r.isAsk)) {
+      const answer = results.map((r) => askResultToAnswerText(r.rawText)).join('\n\n')
+      return { content: answer, type: 'ask', history }
+    }
+
+    // 工具结果的回传信封有两种官方形态，由 resultEnvelope 选：
+    //   'review'（默认）—— 桌面客户端子 Agent 循环（orcaterm_start/app.js）：
+    //     {type:'review', reviewAction:'reportToolResult', toolResult, tool}
+    //     实测对照：该协议下模型精确消费结果内容。
+    //   'ask' —— 主循环模块 2481 导出的 reportToolResult（`st`）：
+    //     {type:'ask', input:'{TOOL_RESULT}(<tool.name>): <result>'}
+    //     工具名标签常量 ASSISTANT_TOOL_RESULT_MSG_TAG='TOOL_RESULT'（模块 68280）。
+    if (resultEnvelope === 'ask') {
+      const merged = results
+        .map((r) => wrapToolResultInput(r.origTool?.name || r.orcaTag, appendSpillHint(redactSecrets(r.rawText))))
+        .join('\n\n')
+      return { content: merged, type: 'ask', toolResultText: merged, history }
+    }
+
     // 多个结果合并为一份 toolResult（官方客户端逐个回传且等待响应；DSH 一次性给全部，只能合并）。
     const merged = reviewTexts.length === 1
       ? reviewTexts[0]
@@ -373,6 +414,11 @@ export function buildConfig(options = {}) {
     assistantCookies,
     // 默认不把 DSH 的多轮历史发给上游：上游会把它原样回灌成 ai 帧污染正文，见 upstream.assistantBody。
     sendHistoryMessages: options.sendHistoryMessages === true || process.env.ORCA_SEND_HISTORY === '1',
+    // 工具结果回传信封：'review'（默认，官方子 Agent 循环形态）| 'ask'（官方主循环形态）。
+    // 两种都是真实逆向结论，默认值由 live A/B 定；见 README「工具结果回传的两种官方形态」。
+    resultEnvelope: String(options.resultEnvelope || process.env.ORCA_RESULT_ENVELOPE || 'review').toLowerCase() === 'ask'
+      ? 'ask'
+      : 'review',
   }
   // 凭据是桌面端登录态的**快照**：token 只有 ~2h 寿命，桌面端运行中会持续刷新 store。
   // 历史上多次出现「dsh web 报 Invalid or expired AccessToken、重启反代才恢复」，根因就是它。
@@ -401,6 +447,44 @@ function rememberOriginalTool(callId, tool) {
   ORIG_TOOL_BY_CALL.delete(callId)
   ORIG_TOOL_BY_CALL.set(callId, tool)
   while (ORIG_TOOL_BY_CALL.size > ORIG_TOOL_MAX) ORIG_TOOL_BY_CALL.delete(ORIG_TOOL_BY_CALL.keys().next().value)
+}
+
+/**
+ * 调用级「这是提问」标记：callId → 上游 ask 信封。
+ *
+ * 提问信封里没有 tool 对象，回传时走的也不是 reportToolResult —— 官方对「答复提问」
+ * 用的是 respondToAsk（模块 2481 `at`）：`{type:'ask', input:<用户答复原文>}`。
+ * 光靠 ORIG_TOOL_BY_CALL 分不出这两种回传，所以另记一张表。
+ * 与 ORIG_TOOL_BY_CALL 同寿命、同容量策略。
+ */
+const ORCA_ASK_BY_CALL = new Map()
+function rememberAskEnvelope(callId, envelope) {
+  if (!callId || !envelope) return
+  ORCA_ASK_BY_CALL.delete(callId)
+  ORCA_ASK_BY_CALL.set(callId, envelope)
+  while (ORCA_ASK_BY_CALL.size > ORIG_TOOL_MAX) ORCA_ASK_BY_CALL.delete(ORCA_ASK_BY_CALL.keys().next().value)
+}
+
+/**
+ * 本轮消息里哪些 tool_call_id 是「上游提问」。
+ * 只看最后一个 assistant 声明的调用 —— 只有它的结果会出现在本轮工具结果里。
+ * @param {Array} messages OpenAI 形态消息数组
+ * @returns {Set<string>} 可能是空集
+ */
+function askCallIdsOf(messages) {
+  const out = new Set()
+  if (ORCA_ASK_BY_CALL.size === 0) return out
+  const list = Array.isArray(messages) ? messages : []
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    if (list[i]?.role === 'assistant') {
+      for (const call of Array.isArray(list[i]?.tool_calls) ? list[i].tool_calls : []) {
+        const id = String(call?.id ?? '')
+        if (id !== '' && ORCA_ASK_BY_CALL.has(id)) out.add(id)
+      }
+      break
+    }
+  }
+  return out
 }
 
 /**
@@ -509,7 +593,15 @@ async function handleChat(config, req, res) {
     })
   }
 
-  const { content, history, type, toolResultText, reviewInput } = toAssistantInput(payload.messages)
+  // 工具结果回传信封的逐轮覆盖（live A/B 与回归测试用）：`orca_result_envelope: 'ask'|'review'`。
+  // 默认取配置；显式传了就以请求为准，省得为了换一次形态重启后端。
+  const resultEnvelope = payload.orca_result_envelope === 'ask' || payload.orca_result_envelope === 'review'
+    ? payload.orca_result_envelope
+    : config.resultEnvelope
+  const { content, history, type, toolResultText, reviewInput } = toAssistantInput(payload.messages, {
+    resultEnvelope,
+    askCallIds: askCallIdsOf(payload.messages),
+  })
   // 本轮是否发历史：默认不发（上游会回灌污染正文）；但调用方做「上下文对账」后判定需要
   // 补发时（换新会话同步 DSH 的压缩结果）可以逐轮覆盖 —— provider 传 orca_send_history。
   const sendHistory = config.sendHistoryMessages === true || payload.orca_send_history === true
@@ -721,6 +813,40 @@ async function serveChat(config, req, res, payload, round) {
     })
   }
 
+  // 调用方是否声明了 ask_user_question —— 上游提问信封只有在宿主真能开弹窗时才转成工具调用，
+  // 否则退回「正文 + 选项清单」，避免下发一个宿主执行不了的工具名。
+  const askToolDeclared = (Array.isArray(payload.tools) ? payload.tools : [])
+    .some((item) => (item?.function?.name || item?.name) === ASK_TOOL_NAME)
+
+  /**
+   * 上游提问信封 → DSH ask_user_question 工具调用。
+   *
+   * 官方客户端拿到 `{action:'ask',question,options}` 时开的是带选项的提问对话框
+   * （信封里带 options 正是为此），DSH 侧对应的就是 ask_user_question。
+   * 转成工具调用后，答案按官方 respondToAsk 形态（`{type:'ask',input:<答复>}`）回传。
+   *
+   * @param {object} obj 上游 ask 信封
+   * @returns {boolean} 是否真的下发了工具调用
+   */
+  function emitAskToolCall(obj) {
+    if (!askToolDeclared) return false
+    const args = askEnvelopeToQuestionTool(obj, { idPrefix: `orca-q-${seqId.slice(0, 8)}` })
+    if (!args) return false
+    toolCallSeq += 1
+    const callObj = {
+      index: toolCallSeq - 1,
+      id: `call_orca_ask_${seqId.slice(0, 8)}_${toolCallSeq}`,
+      type: 'function',
+      function: { name: ASK_TOOL_NAME, arguments: JSON.stringify(args) },
+    }
+    // 提问不是工具执行结果：标记 callId，回传轮据此走 respondToAsk 而不是 reportToolResult。
+    rememberAskEnvelope(callObj.id, obj)
+    lastToolCalls.push(callObj)
+    toolCalls += 1
+    pushDelta({ tool_calls: [callObj] })
+    return true
+  }
+
   // 所有正文统一出口（两级）：
   //   pipeContent —— fenced 工具信封拦截 + 下发（已过全部滤镜的正文才进这里）
   //   emitContent —— 问候语剥离 → 重复正文剥离 → pipeContent
@@ -858,12 +984,16 @@ async function serveChat(config, req, res, payload, round) {
       }
       let fallbackText = plainTextFallback
       let fallbackThinking = ''
+      // 提问信封先存着、晚点再下发：正文要在工具调用之前，顺序不能倒。
+      let askObj = null
       try {
         const clean = plainTextFallback.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim()
         const obj = JSON.parse(clean)
         fallbackText = obj.taskCompletion || obj.question || obj.content || obj.text || plainTextFallback
         if (typeof obj.thinking === 'string' && obj.thinking !== '') fallbackThinking = obj.thinking
-        if (Array.isArray(obj.options) && obj.options.length > 0) {
+        if (obj.action === 'ask' && typeof obj.question === 'string') askObj = obj
+        // 能转成 ask_user_question 时选项会进弹窗，正文里不再重复列一遍。
+        if (askObj === null && Array.isArray(obj.options) && obj.options.length > 0) {
           fallbackText += `\n\n**选项：**\n${obj.options.map((o) => `- ${o}`).join('\n')}`
         }
       } catch { /* 非 JSON，原文兜底 */ }
@@ -872,12 +1002,19 @@ async function serveChat(config, req, res, payload, round) {
         pushDelta({ reasoning_content: fallbackThinking })
       }
       emitContent(fallbackText)
+      if (askObj !== null) emitAskToolCall(askObj)
     } else if (hasEmittedTarget) {
       // 如果触发了 ask 提问工具且带 options 选项，将选项追加到末尾
       try {
         const clean = plainTextFallback.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim()
         const obj = JSON.parse(clean)
-        if (Array.isArray(obj.options) && obj.options.length > 0) {
+        // 提问信封：转成 ask_user_question 工具调用（DSH 侧开提问弹窗）。
+        // 正文已经流式吐出去了（问题原文照常可见），这里只补工具调用；
+        // 转成功就不再追加「**选项：**」清单 —— 选项在弹窗里，重复列一遍反而像两套 UI。
+        const askToolEmitted = obj.action === 'ask' && typeof obj.question === 'string'
+          ? emitAskToolCall(obj)
+          : false
+        if (!askToolEmitted && Array.isArray(obj.options) && obj.options.length > 0) {
           const optsText = `\n\n**选项：**\n${obj.options.map((o) => `- ${o}`).join('\n')}`
           pushDelta({ content: optsText })
           emittedText += optsText

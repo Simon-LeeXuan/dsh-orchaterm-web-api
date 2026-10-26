@@ -7,6 +7,9 @@ import { createContextTracker, fingerprintMessages } from '../lib/context.js'
 import { DEFAULTS, MANAGER_KEYS } from '../lib/config.js'
 import { flattenContent, formatOpenAiMessages } from '../lib/openai.js'
 import {
+  askEnvelopeToQuestionTool,
+  askResultToAnswerText,
+  ASK_TOOL_NAME,
   classifyCommandShell,
   classifyUiToolCategory,
   createDeliveredHistory,
@@ -21,10 +24,12 @@ import {
   resolveDshToolCall,
   rewriteCommandChain,
   splitCommandChain,
+  toDshOption,
   toWindowsPath,
   UI_TOOL_FOREGROUND,
   UI_TOOL_HEADLESS,
   wrapCommandForShell,
+  wrapToolResultInput,
 } from '../backend/agent-protocol.js'
 
 console.log('1. 验证插件基本导出与元数据...')
@@ -685,6 +690,179 @@ console.log('25. 验证未决 review 的用户文本走 feedback 通道（官方
   // 25d. 首轮（无 assistant）不受影响
   const fresh = toAssistantInput([{ role: 'user', content: '你好' }])
   assert.equal(fresh.type, 'start')
+}
+
+console.log('26. 验证 ask 提问信封 ⇄ DSH ask_user_question 双向适配...')
+{
+  // 26a. 选项是纯字符串（上游实测形态）→ 映射成 {label}，并按信封原文给出问题
+  const ask = { action: 'ask', question: '请问您想清理哪个目录？', options: ['临时文件夹', '系统临时文件夹', '我自己指定路径'] }
+  const args = askEnvelopeToQuestionTool(ask, { idPrefix: 'orca-q-test' })
+  assert.equal(args.questions.length, 1)
+  assert.equal(args.questions[0].id, 'orca-q-test')
+  assert.equal(args.questions[0].question, '请问您想清理哪个目录？')
+  assert.deepEqual(args.questions[0].options, [{ label: '临时文件夹' }, { label: '系统临时文件夹' }, { label: '我自己指定路径' }])
+  // 单选语义：信封没声明多选时不下发 multi_select（DSH 默认单选）
+  assert.equal('multi_select' in args.questions[0], false)
+
+  // 26b. 选项是对象（{label,description}）→ 描述透传
+  const objAsk = askEnvelopeToQuestionTool({
+    action: 'ask',
+    question: '选哪个？',
+    options: [{ label: 'A', description: '第一个' }, { label: 'B' }],
+  })
+  assert.deepEqual(objAsk.questions[0].options, [{ label: 'A', description: '第一个' }, { label: 'B' }])
+
+  // 26c. 没有 question 字段 → 不产出（调用方退回正文+选项清单）
+  assert.equal(askEnvelopeToQuestionTool({ action: 'ask', options: ['A'] }), null)
+  assert.equal(askEnvelopeToQuestionTool({ action: 'ask', question: '   ' }), null)
+
+  // 26d. 无选项也能成问题（DSH 弹窗降级为自由文本输入框）
+  const noOpts = askEnvelopeToQuestionTool({ action: 'ask', question: '部署到哪个环境？' })
+  assert.equal(noOpts.questions[0].options, undefined)
+
+  // 26e. 选项形状兜底：非字符串非对象、空串一律丢掉，不产出空 label
+  assert.equal(toDshOption('  x  ').label, 'x')
+  assert.equal(toDshOption('   '), null)
+  assert.equal(toDshOption(42), null)
+  assert.equal(toDshOption(null), null)
+  assert.equal(toDshOption({ name: 'name 键也算 label' }).label, 'name 键也算 label')
+
+  // 26f. 工具名常量与 DSH 工具定义一致（packages/interaction/tool-ask-user）
+  assert.equal(ASK_TOOL_NAME, 'ask_user_question')
+
+  // 26g. DSH 答复 → 上游答复正文（官方 respondToAsk 的 input）
+  assert.equal(
+    askResultToAnswerText(JSON.stringify({ answers: [{ id: 'orca-q-test', selected: ['临时文件夹'] }] })),
+    '临时文件夹',
+  )
+  assert.equal(
+    askResultToAnswerText(JSON.stringify({ answers: [{ id: 'q', selected: ['A', 'B'], custom: '补充' }] })),
+    'A、B、补充',
+  )
+  // 用户跳过（selected 空、无 custom）→ 给一句明确说明，不能回空串让上游以为没答复
+  assert.equal(askResultToAnswerText(JSON.stringify({ answers: [{ id: 'q', selected: [] }] })), '（用户跳过了这个问题，没有给出答复）')
+  assert.equal(askResultToAnswerText(JSON.stringify({ answers: [] })), '（用户跳过了这个问题，没有给出答复）')
+  // 未决（DSH 延迟应答）与非法输入
+  assert.equal(askResultToAnswerText(JSON.stringify({ pending: true })), '（用户跳过了这个问题，没有给出答复）')
+  assert.equal(askResultToAnswerText('用户说：先别动'), '用户说：先别动')
+  assert.equal(askResultToAnswerText(''), '（用户跳过了这个问题，没有给出答复）')
+
+  // 26h. 逐轮信封开关：默认 review（桌面端唯一消费的形态），显式传 ask 才切
+  const toolCalls = [{ id: 'call_x_1', type: 'function', function: { name: 'pwsh', arguments: '{"command":"dir"}' } }]
+  const msgs = [
+    { role: 'assistant', content: '', tool_calls: toolCalls },
+    { role: 'tool', tool_call_id: 'call_x_1', content: 'done' },
+  ]
+  assert.equal(toAssistantInput(msgs).reviewInput.reviewAction, 'reportToolResult')
+  const asked = toAssistantInput(msgs, { resultEnvelope: 'ask' })
+  assert.equal(asked.type, 'ask')
+  assert.equal(asked.reviewInput, undefined)
+  // 官方 reportToolResult 的 input 形态：{TOOL_RESULT}(<tool.name>): <result>
+  assert.equal(asked.content.startsWith('{TOOL_RESULT}(execute_command): '), true)
+  assert.equal(asked.content.endsWith('done'), true)
+  // 26i. 标签生成器（模块 73383 的 v/b）在两种名字形态下的输出
+  assert.equal(wrapToolResultInput('remote_read', 'X'), '{TOOL_RESULT}(remote_read): X')
+  assert.equal(wrapToolResultInput('', 'X'), '{TOOL_RESULT}: X')
+  assert.equal(wrapToolResultInput('bad name!', 'X'), '{TOOL_RESULT}: X')
+  // 26j. 已知是提问的 callId → 回程走 respondToAsk（不带 {TOOL_RESULT} 标签）
+  const asAsk = toAssistantInput(
+    [
+      { role: 'assistant', content: '', tool_calls: [{ id: 'call_ask_1', type: 'function', function: { name: 'ask_user_question', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'call_ask_1', content: JSON.stringify({ answers: [{ id: 'q', selected: ['B'] }] }) },
+    ],
+    { askCallIds: new Set(['call_ask_1']) },
+  )
+  assert.equal(asAsk.type, 'ask')
+  assert.equal(asAsk.content, 'B')
+  assert.equal(asAsk.reviewInput, undefined)
+}
+
+console.log('27. 验证结构化指令残缺时的兜底（畸形 ask 信封 / 畸形答复 / 丢档 / 混批）...')
+{
+  // ── 畸形 ask 信封：模型把 options 写成各种样子 ──────────────────
+  // 27a. options 里混进 null / 数字 / 空白串 / 缺 label 的对象 → 逐个丢掉，不产出空 label
+  const messy = askEnvelopeToQuestionTool({
+    action: 'ask',
+    question: '选一个',
+    options: ['A', null, 42, '   ', {}, { description: '没有 label' }, { label: '  B  ', description: '  ' }],
+  })
+  assert.deepEqual(messy.questions[0].options, [{ label: 'A' }, { label: 'B' }])
+  // 27b. 选项列表超长 → 截到上限，弹窗不被撑爆
+  const many = askEnvelopeToQuestionTool({ action: 'ask', question: 'q', options: Array.from({ length: 40 }, (_, i) => `opt${i}`) })
+  assert.equal(many.questions[0].options.length, 12)
+  // 27c. question 不是字符串（模型写成数字/对象）→ 不产出，调用方退回正文+清单
+  assert.equal(askEnvelopeToQuestionTool({ action: 'ask', question: 123 }), null)
+  assert.equal(askEnvelopeToQuestionTool({ action: 'ask', question: { text: 'x' } }), null)
+  // 27d. 可选字段透传：header 与 multiSelect
+  const withHeader = askEnvelopeToQuestionTool({ action: 'ask', question: 'q', header: '  确认  ', multiSelect: true })
+  assert.equal(withHeader.questions[0].header, '确认')
+  assert.equal(withHeader.questions[0].multi_select, true)
+  // 27e. header 是空白串 → 不下发该字段（避免弹窗出现空标题）
+  assert.equal('header' in askEnvelopeToQuestionTool({ action: 'ask', question: 'q', header: '   ' }).questions[0], false)
+
+  // ── 畸形答复：DSH 回传的工具结果不是我们以为的 JSON ─────────────
+  const SKIP = '（用户跳过了这个问题，没有给出答复）'
+  // 27f. answers 缺字段 / 不是数组 → 原文兜底，不吞内容
+  assert.equal(askResultToAnswerText(JSON.stringify({ id: 'x' })), '{"id":"x"}')
+  assert.equal(askResultToAnswerText(JSON.stringify({ answers: 'oops' })), '{"answers":"oops"}')
+  // 27g. selected 里混进非字符串 / 空白 → 过滤掉，保住剩下的
+  assert.equal(askResultToAnswerText(JSON.stringify({ answers: [{ id: 'q', selected: ['A', 42, '', '  ', 'B'] }] })), 'A、B')
+  // 27h. 只有 custom、空白 custom、非字符串 custom
+  assert.equal(askResultToAnswerText(JSON.stringify({ answers: [{ id: 'q', selected: [], custom: '手写答案' }] })), '手写答案')
+  assert.equal(askResultToAnswerText(JSON.stringify({ answers: [{ id: 'q', selected: [], custom: '   ' }] })), SKIP)
+  assert.equal(askResultToAnswerText(JSON.stringify({ answers: [{ id: 'q', selected: [], custom: 7 }] })), SKIP)
+  // 27i. 多问题批次拼成一段（上游信封只有单问题，这里只保证不崩且都带上）
+  assert.equal(
+    askResultToAnswerText(JSON.stringify({ answers: [{ id: 'a', selected: ['X'] }, { id: 'b', custom: 'Y' }] })),
+    'X；Y',
+  )
+  // 27j. 工具报错的文本（非 JSON）原样当答复，不吞掉错误信息
+  assert.equal(askResultToAnswerText('Error: ask_user_question was aborted before the user answered'),
+    'Error: ask_user_question was aborted before the user answered')
+
+  // ── 回传轮：丢档与混批 ─────────────────────────────────────────
+  // 27k. LRU 丢档（进程重启后）→ reconstructOrcaTool 反推，review 信封照样成形
+  const lostCall = [{ id: 'call_lost_1', type: 'function', function: { name: 'read', arguments: '{"file_path":"a.txt"}' } }]
+  const lost = toAssistantInput([
+    { role: 'assistant', content: '', tool_calls: lostCall },
+    { role: 'tool', tool_call_id: 'call_lost_1', content: 'file body' },
+  ])
+  assert.equal(lost.reviewInput.reviewAction, 'reportToolResult')
+  assert.equal(lost.reviewInput.tool.name, 'remote_read')
+  assert.equal(lost.reviewInput.toolResult.includes('file body'), true)
+  // 27l. 工具参数不是合法 JSON（模型吐坏）→ 反推不炸，退化成原样 args
+  const badArgs = toAssistantInput([
+    { role: 'assistant', content: '', tool_calls: [{ id: 'c2', type: 'function', function: { name: 'pwsh', arguments: '{不是 JSON' } }] },
+    { role: 'tool', tool_call_id: 'c2', content: 'ok' },
+  ])
+  assert.equal(badArgs.reviewInput.toolResult.includes('ok'), true)
+  // 27m. 混批（一个提问 + 一个真工具结果）→ 整批走工具结果信封，不做 respondToAsk
+  const mixed = toAssistantInput(
+    [
+      {
+        role: 'assistant', content: '',
+        tool_calls: [
+          { id: 'ask1', type: 'function', function: { name: 'ask_user_question', arguments: '{}' } },
+          { id: 'tool1', type: 'function', function: { name: 'pwsh', arguments: '{"command":"dir"}' } },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'ask1', content: JSON.stringify({ answers: [{ id: 'q', selected: ['A'] }] }) },
+      { role: 'tool', tool_call_id: 'tool1', content: 'done' },
+    ],
+    { askCallIds: new Set(['ask1']) },
+  )
+  assert.equal(mixed.reviewInput.reviewAction, 'reportToolResult')
+  // 27n. 提问与「官方主循环信封」同时启用时，提问优先走 respondToAsk（答复是用户的话，不是 {TOOL_RESULT}）
+  const askWins = toAssistantInput(
+    [
+      { role: 'assistant', content: '', tool_calls: [{ id: 'ask1', type: 'function', function: { name: 'ask_user_question', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'ask1', content: JSON.stringify({ answers: [{ id: 'q', selected: ['B'] }] }) },
+    ],
+    { resultEnvelope: 'ask', askCallIds: new Set(['ask1']) },
+  )
+  assert.equal(askWins.type, 'ask')
+  assert.equal(askWins.content, 'B')
+  assert.equal(askWins.content.includes('{TOOL_RESULT}'), false)
 }
 
 console.log('smoke 测试全部通过！')
