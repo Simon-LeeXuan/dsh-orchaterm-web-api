@@ -140,13 +140,28 @@ cd C:\AITask\dsh-client-config\plugins\dsh-orchaterm-web-api
 A/B 验证能被上游正确消费**（同样问句下都能从结果里读出 `orchaterm-tool-probe` 并给出正确结论），
 所以这是「哪个更贴官方」的选择，不是「哪个能用」的选择。
 
+### 畸形信封的兜底（v0.5.4）
+
+模型会把信封写成**非法 JSON**（实测：`thinking` 的值里带未转义的 `"`）。此时严格 `JSON.parse`
+整包失败，旧代码会退化成「整包原文当正文」——用户看到一大段 ```json，信封里的工具调用丢失。
+v0.5.4 用两层守卫兜住：
+
+| 层 | 组件 | 作用 |
+| --- | --- | --- |
+| 解析 | `recoverToolEnvelope(raw)` | 严格 JSON 失败后按容错路径恢复 `tool`（容忍值里未转义的引号）；必须拿到 `name` 且有 `action`/`args` 证据才认，避免把散文误吞成工具调用 |
+| 流式 | `createEnvelopeFenceGuard()` | 正文里出现 ````json{` 时把该块**挂起到围栏闭合**再判定；是信封就转工具调用，不是就原样放行（不丢字） |
+
+两条都不「吞正文」：判不出来一律原样下发。守卫的代价是那一块的输出会被延迟到围栏闭合 ——
+这是「要么延迟、要么漏拦截」的取舍，因为正文一旦流出就无法收回。
+
 ---
 
 ## 验证
 
 ```powershell
-npm test                       # 离线：cordis/DEFAULTS 静态校验 + 27 组 smoke（消息转换、剥离、判定、路由、映射、身份、脱敏、流控制、提问信封、畸形兜底）
+npm test                       # 离线：cordis/DEFAULTS 静态校验 + 27 组 smoke + 3 组畸形信封回归（见下）
 npm run test:live:regression   # 活体：需反代在跑 + 有效登录态，17 项断言，会让模型真发工具调用
+npm run test:malformed         # 只跑畸形信封回归（假上游驱动，不需要登录态）
 # 凭据说明（v0.3.3）：token 临期/过期时反代自动重读 OrcaTerm 桌面端登录态，并在认证失败时自动重试一次；
 # 只要桌面端开着就不用再手动重启反代。桌面端没开且 token 过期时报 AUTH 属预期。
 ```
@@ -154,6 +169,10 @@ npm run test:live:regression   # 活体：需反代在跑 + 有效登录态，17
 `live_regression.mjs` 覆盖五段：回放剥离 → 工具信封 → 工具结果被接受 → **provider 契约（DSH 原生 `tool-call`/`tool` 消息）** → **上下文对账（fresh/continue/resync）**；
 结束时会把本轮下发的真实命令打印出来，便于在本机直接执行确认「确实跑了」。
 想连「重发历史」这条危险路径一起测，就对 `--send-history` 起的实例跑（例如 8794 端口）。
+
+`malformed_envelope.mjs` 是**假上游驱动**的确定性回归（不需要登录态、不碰真 OrcaTerm）：它按 OrcaTerm 的
+SSE 方言把一份线上实测的**非法 JSON 信封**分片投递，断言反代仍能恢复出工具调用、且原始 JSON 绝不落进正文。
+覆盖两类畸形：模型写出非法 JSON（`thinking` 值里带未转义的 `"`），以及信封被切成多帧到达。
 
 ---
 

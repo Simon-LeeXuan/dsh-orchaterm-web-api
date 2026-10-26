@@ -35,7 +35,6 @@ import {
   createThinkingTagRouter,
   classifyUiToolCategory,
   describeExecutionHost,
-  parseToolEnvelope,
   redactSecrets,
   REPORT_RETRY_TIMEOUT_MS,
   reportRetryBackoffMs,
@@ -45,10 +44,12 @@ import {
   askResultToAnswerText,
   ASK_TOOL_NAME,
   wrapToolResultInput,
+  recoverToolEnvelope,
+  createEnvelopeFenceGuard,
 } from './agent-protocol.js'
 import { redact, resolveCredentials, cookieHeaderFor, decodeJwtExp } from './credentials.js'
 
-export const VERSION = '0.5.3'
+export const VERSION = '0.5.4'
 
 /** 能力自述：插件的 contract.js 按这份清单决定是否复用已起的后端。 */
 export const CAPABILITIES = Object.freeze([
@@ -430,6 +431,16 @@ export function buildConfig(options = {}) {
   return config
 }
 
+/** 后端 stderr 一行诊断（插件 detach 时由 logFile 收走，否则随父进程 stderr）。
+ * 只在异常路径调用，正常回合保持 stderr 干净。 */
+function warnLine(message) {
+  try {
+    process.stderr.write(`orchaterm2api: ${message}\n`)
+  } catch {
+    // stderr 断了也不能影响正在进行的响应
+  }
+}
+
 /** 认证类上游错误的判据（用于触发「刷新凭据 + 重试一次」）。 */
 const AUTH_ERROR_RE = /Invalid or expired AccessToken|NEED_UIN_AND_SKEY|VERIFY_USER_FAILED|assistant_unavailable/i
 
@@ -787,7 +798,8 @@ async function serveChat(config, req, res, payload, round) {
   // OrcaTerm Agent 的 MCP 工具调用协议：{"action":"review|execute|...","tool":{type,name,args}}
   // 拦截后智能映射为 DSH 本机工具契约（如 execute_command -> pwsh/bash，remote_read -> read 等），
   // 并以标准 OpenAI tool_calls delta 下发，驱动 DSH 本地执行并回传工具结果。
-  const tryToolEnvelope = parseToolEnvelope
+  // 信封识别统一走 recoverToolEnvelope（严格 JSON 失败时按容错路径恢复），不再直接用
+  // 严格版 parseToolEnvelope —— 模型偶发的非法 JSON 会让严格版整包失败（见 agent-protocol.js §10）。
 
   let toolCallSeq = 0
   const lastToolCalls = []
@@ -852,23 +864,56 @@ async function serveChat(config, req, res, payload, round) {
   //   emitContent —— 问候语剥离 → 重复正文剥离 → pipeContent
   // emittedText：真正下发给客户端的正文（非流式响应用它作 content）。
   let emittedText = ''
+
+  // 跨帧围栏守卫：信封被切成多帧时，逐帧正则永远等不到同时含首尾围栏的那一帧，
+  // 原始 JSON 就会漏给用户（实测 session-dba58595 turn 8）。守卫把疑似块挂起到闭环再判定。
+  const fenceGuard = createEnvelopeFenceGuard()
+
+  /**
+   * 把被打断的思考链尾段改道进 reasoning。
+   *
+   * 畸形信封里 thinking 常被未转义引号截断，状态机只吐出了前半段；兜底恢复能取到完整值，
+   * 差额补进 reasoning —— 否则这段思考会随原始 JSON 一起漏进正文。
+   */
+  function appendReasoningTail(full) {
+    if (!full || full === '') return
+    if (!full.startsWith(reasoning)) return
+    const tail = full.slice(reasoning.length)
+    if (tail === '') return
+    reasoning += tail
+    pushDelta({ reasoning_content: tail })
+  }
+
+  /**
+   * 判定一个 fenced 块：是工具信封就转工具调用，不是就**原样**放行（含围栏，不丢字）。
+   * @param {string} block 块原文（含 ``` 围栏）
+   * @returns {boolean} 是否识别成了工具信封
+   */
+  function handleCandidate(block) {
+    const recovered = recoverToolEnvelope(block)
+    if (recovered) {
+      appendReasoningTail(recovered.thinking)
+      // 畸形信封是模型侧的输出缺陷，但要留痕：否则「这一轮为什么有工具调用」事后无从查起。
+      if (recovered.recovered) {
+        warnLine(`本回合的信封不是合法 JSON，已按兜底恢复：tool=${recovered.envelope?.tool?.name || '?'}`
+          + ` action=${recovered.envelope?.action || '?'} argsRecovered=${recovered.argsRecovered}`)
+      }
+      emitToolCall(recovered.envelope)
+      return true
+    }
+    pushDelta({ content: block })
+    emittedText += block
+    return false
+  }
+
   function pipeContent(delta) {
     if (!delta) return
-    emittedText += delta
-    if (delta.includes('```')) {
-      // 贪婪匹配到收尾 ```：工具信封含嵌套对象（args:{...}}），非贪婪会在内层 } 截断
-      const fence = delta.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/)
-      if (fence) {
-        const obj = tryToolEnvelope(fence[1])
-        if (obj) {
-          const before = delta.slice(0, fence.index)
-          if (before.trim()) pushDelta({ content: before })
-          emitToolCall(obj)
-          return
-        }
-      }
+    const step = fenceGuard.feed(delta)
+    if (step.emit) {
+      pushDelta({ content: step.emit })
+      emittedText += step.emit
     }
-    pushDelta({ content: delta })
+    if (step.candidate) handleCandidate(step.candidate)
   }
 
   function emitContent(delta) {
@@ -889,6 +934,14 @@ async function serveChat(config, req, res, payload, round) {
     const tagTail = thinkingTag.flush()
     if (tagTail) pipeContent(tagTail)
     pipeContent(repeat.flush())
+    // 围栏守卫放最后：挂起期间它吞下了后续所有正文（含上面这些 tail），
+    // 所以在最后交还才能保持原序；放行前仍按信封判定一次，不浪费这次拦截机会。
+    const heldStep = fenceGuard.flush()
+    if (heldStep.emit) {
+      pushDelta({ content: heldStep.emit })
+      emittedText += heldStep.emit
+    }
+    if (heldStep.candidate) handleCandidate(heldStep.candidate)
   }
 
   function feedUnwrap(chunk) {
@@ -975,11 +1028,20 @@ async function serveChat(config, req, res, payload, round) {
   }
 
   function finishUnwrap() {
-    if (!hasEmittedTarget && plainTextFallback.trim()) {
-      // 整包到达时的兜底：优先识别工具信封（action + tool 字段）
-      const toolObj = tryToolEnvelope(plainTextFallback)
-      if (toolObj) {
-        emitToolCall(toolObj)
+    // 围栏守卫还挂着东西时，这一整包的归属权归它（它已把围栏前的正文与围栏后的尾巴放行，
+    // 挂起块会在 flushContent 里连同判定一起处理）——这里再走一遍就会重复下发。
+    if (!hasEmittedTarget && !fenceGuard.holding() && plainTextFallback.trim()) {
+      // 整包到达时的兜底：优先识别工具信封 —— 这里必须用**容错**恢复。
+      // 模型偶发把信封写成非法 JSON（实测：thinking 值里带未转义的 "），严格 JSON.parse 必死；
+      // 若就此退化成「原文当正文」，用户会看到一整块 ```json 且工具调用丢失（session-dba58595 turn 8）。
+      const recovered = recoverToolEnvelope(plainTextFallback)
+      if (recovered) {
+        appendReasoningTail(recovered.thinking)
+        if (recovered.recovered) {
+          warnLine(`本回合的信封不是合法 JSON，已按兜底恢复：tool=${recovered.envelope?.tool?.name || '?'}`
+            + ` action=${recovered.envelope?.action || '?'} argsRecovered=${recovered.argsRecovered}`)
+        }
+        emitToolCall(recovered.envelope)
         return
       }
       let fallbackText = plainTextFallback

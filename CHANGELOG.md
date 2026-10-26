@@ -1,5 +1,71 @@
 All notable changes to the `dsh-orchaterm-web-api` plugin will be documented in this file.
 
+## [0.5.4] - 2026-10-27
+
+修一个**信封漏进正文**的实报缺陷（用户点名：`session-dba58595` turn 8「帮我关机，关闭电脑」）。
+
+### 故障现场（来自会话日志，逐事件核对）
+那一轮 assistant 消息里只有一条 `text` 块，内容是**整块原始信封**：
+
+```
+```json
+{ "action": "review", "thinking": "…但用户已经明确说"帮我关机，关闭电脑"，…",
+  "tool": { "type": "mcp", "mcpServer": "mcp-server-orcaterm-oauth",
+            "name": "execute_command", "args": { "command": "shutdown /s /t 0" } } }
+```
+```
+
+后果：DSH 没有任何 tool_call，关机命令没被执行；用户看到一大段 JSON。
+**现场特征**：reasoning 恰好被截在 `但用户已经明确说`（未转义引号的断点），正文是整块围栏 JSON。
+
+### Root cause
+模型把信封写成了**非法 JSON** —— `thinking` 的值里带了未转义的 `"`。于是：
+1. `parseToolEnvelope` 的 `JSON.parse` 整包失败 → 返回 null；
+2. `finishUnwrap` 的兜底接着又 `JSON.parse` 一次 → 仍然抛异常 → catch；
+3. `fallbackText = plainTextFallback` → **整包原文当正文下发**，信封里的工具调用就此丢失。
+
+只要模型输出非法 JSON，信封就必然走这条链路 —— 与「模型心情」绑定的间歇性缺陷。
+
+### 另修同类来路的第二条通道
+正文侧的围栏拦截过去是对**单个 delta** 做 ```` ```…``` ```` 正则匹配。线上信封会被切成几十帧，
+逐帧匹配永远等不到同时含首尾围栏的那一帧，原始 JSON 直接流给用户。
+
+### Added
+- `recoverToolEnvelope(raw)`：严格解析失败后的**容错恢复**。定位 `"tool"` 对象，用容忍未转义引号的
+  取值器（收尾引号 = 后面跟 `,`/`}`/`]` 的那个）读出 `name`/`type`/`mcpServer`/`description`/`args`，
+  并顺带取回完整 `thinking`。判据刻意收紧：必须拿到 `name`，且还要有「信封证据」
+  （显式 `action` 或 `args` 对象）—— 宁可漏拦截，也不把散文里顺口一提的 `"tool": {…}` 误吞成工具调用。
+- `createEnvelopeFenceGuard({maxHold})`：跨帧围栏守卫。疑似信封的 fenced 块**挂起到闭环**再判定；
+  挂起期间不出字，闭环后交给 `recoverToolEnvelope`：是信封就转工具调用（并**不下发**原始 JSON），
+  不是就**原样**放行（含围栏，不丢一个字）。`maxHold` 超限与 `flush()` 都把内容原样交还调用方，
+  绝不吞正文。
+- 被打断的思考链尾段改道：畸形信封里状态机只吐出了 `thinking` 的前半段，恢复出的完整值差额补进
+  reasoning —— 否则这段思考会随原始 JSON 一起漏进正文。
+- 后端 stderr 一行诊断（仅在恢复生效时）：`本回合的信封不是合法 JSON，已按兜底恢复：tool=… action=…`。
+  畸形信封是模型侧输出缺陷，但必须留痕，否则事后无从解释「这一轮为什么有工具调用」。
+
+### Fixed
+- `finishUnwrap` 整包兜底改用容错恢复：非法 JSON 不再退化成「原文当正文」。
+- 围栏守卫还挂着内容时，`finishUnwrap` 不再重复处理同一段文本（归属权归守卫，避免双份下发）。
+- `createEnvelopeFenceGuard` 的单帧超长路径也会立即放行（原先只在跨帧路径检查 `maxHold`）。
+
+### Verified
+- **新增 `test/malformed_envelope.mjs`（已接入 `npm test`）**：用假上游（说 OrcaTerm SSE 方言）
+  把线上那份**逐字符照抄**的畸形信封分 6 片投递，断言反代必须产出
+  `pwsh {command:"shutdown /s /t 0"}`、`finish_reason=tool_calls`、**正文里不含 `action`/`mcpServer`/
+  命令/围栏**、且思考尾段进了 reasoning。
+- 该测试**先证明能抓到 bug**：把 `finishUnwrap` 临时换回修复前的严格解析逻辑，同一测试报
+  `应恰好 1 个工具调用，实际 0；正文={"action": "review", "thinking": …}` —— 与线上现象一致；
+  换回修复后转绿。（测试内还断言样本确实是非法的 `JSON.parse`，保证它测的是兜底路径。）
+- `npm test` 全绿（config_check + smoke 27 组 + malformed_envelope 3 组）；活体回归 **17/17**
+  （正文流式未受影响：守卫只在正文出现 ````json{` 时才挂起）；`/health` v0.5.4；正常回合 stderr 空。
+
+### 边界
+- 容错恢复是**尽力而为**：若 `args` 本身也是非法 JSON，仍能恢复工具名（`args` 退化成空对象，
+  由 `resolveDshToolCall` 兜底），但恢复不出具体参数 —— 诊断行里的 `argsRecovered=false` 会标明。
+- 守卫会在正文出现 ````json{` 时**延迟**该块的输出到围栏闭合（内容最终原样到达）。
+  这是「要么延迟、要么漏拦截」的取舍：正文一旦流出就无法收回。
+
 ## [0.5.3] - 2026-10-27
 
 把「上游提问」接成 DSH 的原生提问弹窗，并补上第二种官方工具结果信封；两者都经**真实 dsh web

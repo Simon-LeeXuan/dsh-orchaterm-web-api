@@ -910,7 +910,8 @@ st = (e,t)     => et({type: y.tw.ASK, input: $v(tool.name)(…, e)}, …)   // r
 
 ### 20.6 关于「结构化指令可能存在缺陷」的兜底清单
 用户点名的风险按层落到这些守卫上（每条都有断言）：
-1. 信封整包畸形 → `parseToolEnvelope` 返 null，正文原文兜底；
+1. 信封整包畸形 → v0.5.3 时是「原文当正文」兜底；**这条已被 v0.5.4 取代**（见 §21）：
+   现在走 `recoverToolEnvelope` 容错恢复，恢复不出才原样下发。
 2. 围栏内嵌套对象 → `pipeContent` 用贪婪 `\{[\s\S]*\}`（非贪婪会在内层 `}` 截断）；
 3. `action:'ask'` 但 question 不是字符串/为空 → 不产工具调用，退回正文+清单；
 4. `options` 混进 null/数字/空串/缺 label 对象 → 逐个丢弃，不产空 label；
@@ -919,3 +920,73 @@ st = (e,t)     => et({type: y.tw.ASK, input: $v(tool.name)(…, e)}, …)   // r
 7. 工具名带非法字符 → 退化成无 `(name)` 的 `{TOOL_RESULT}: `，不违反官方入站正则；
 8. LRU 丢档（进程重启）→ `reconstructOrcaTool` 反推；参数坏 JSON → 退化成原样 args 不抛；
 9. 混批（提问+真工具结果）→ 整批走工具结果信封（DSH 一次给全部，只能取其一）。
+
+---
+
+## 21. 信封漏进正文：非法 JSON 的容错恢复 + 跨帧围栏守卫（v0.5.4）
+
+### 21.1 用户实报
+`session-dba58595-6804-4eb3-a1fa-6ca14e81341a` turn 8（「帮我关机，关闭电脑」）：
+第一次尝试调用关机命令时，**结构化 JSON 落进了正文，没有被 tools 捕捉**。
+
+### 21.2 现场（会话日志逐事件核对，seq 204-207）
+```
+#204 user/message  帮我关机，关闭电脑
+#205 assistant/message  content = [
+       {type:'reasoning', text:'用户要求关机。…但用户已经明确说'},        ← 恰好截在未转义引号处
+       {type:'text', text:'```json … "action": "review" … "thinking": "…但用户已经明确说"帮我关机，关闭电脑"，…"
+                          … "tool": {… "name": "execute_command", "args": {"command": "shutdown /s /t 0"} …} … ```'}
+     ]
+#206 step/end
+#207 turn/end（completed）      ← 没有任何 tool/call，关机命令没执行
+```
+下一轮用户补了一句「使用 shutdown /s /t 0 命令立即关机」才跑成（`#214 tool/call pwsh`）。
+
+### 21.3 根因
+模型输出的信封是**非法 JSON**：`thinking` 的值里带了未转义的 `"`。链路：
+`parseToolEnvelope` → `JSON.parse` 抛 → 返回 null → `finishUnwrap` 兜底再 `JSON.parse` 一次 →
+再抛 → catch → `fallbackText = plainTextFallback` → **整包原文当正文**。
+只要模型输出非法 JSON 就必然复现，属「和模型心情绑定的间歇缺陷」。
+
+同时发现**同类症状的第二条来路**：正文侧围栏拦截是对**单个 delta** 做 ```` ```…``` ```` 匹配，
+而线上信封会被切成几十帧 —— 逐帧匹配永远等不到同时含首尾围栏的那一帧。
+
+### 21.4 为什么这个 bug 以前测不出来
+`live_regression` 的工具轮靠**提示词诱导模型正常发信封**，畸形信封是概率事件，跑十次不一定撞上；
+离线 smoke 只测纯函数（`parseToolEnvelope` 喂合法/明显非法输入），而 `finishUnwrap` 是 `serveChat` 的
+闭包，**根本不可单测**。所以这轮补的不是断言，是**可复现的驱动方式**：假上游。
+
+### 21.5 实现
+- `recoverToolEnvelope(raw)`（agent-protocol.js）：严格解析失败后按容错路径恢复 —— 定位 `"tool"` 对象，
+  用 `scanJsonStringValue`（收尾引号 = 后面跟 `,`/`}`/`]` 的那个）容忍值里未转义的引号；
+  `looseObjectField` 用**字符串感知**的花括号配平取 `args`（坏的是同一包里的 thinking，不影响 args）。
+  判据收紧：必须拿到 `name`，且必须有 `action` 或 `args` 之一作「信封证据」。
+- `createEnvelopeFenceGuard()`：正文出现 ````json{` 就把该块挂起到围栏闭合再判定；
+  `maxHold` 超限 / `flush()` 一律把内容原样交还调用方（**绝不吞正文**）。
+- `server.js`：`finishUnwrap` 与 `pipeContent` 都改走容错恢复；恢复出的 `thinking` 与原
+  reasoning 的差额补进 reasoning（否则思考尾段随原始 JSON 漏进正文）；守卫挂起时
+  `finishUnwrap` 让出归属权（避免同一段文本下发两次）；恢复生效时打一行 stderr 诊断。
+
+### 21.6 验证（关键：先证明测试抓得住 bug）
+- 新增 `test/malformed_envelope.mjs`，已接入 `npm test`。假上游按 OrcaTerm SSE 方言把线上那份
+  **逐字符照抄**的畸形信封分 6 片投递，断言：恰好 1 个工具调用 `pwsh{command:"shutdown /s /t 0"}`、
+  `finish_reason=tool_calls`、正文不含 `action`/`mcpServer`/命令/围栏、思考尾段进 reasoning。
+- **修复前 vs 修复后**（同一测试、同一份字节，只把 `finishUnwrap` 临时换回严格解析）：
+  ```
+  修复前: AssertionError: 应恰好 1 个工具调用，实际 0；正文={ "action": "review", "thinking": "用户要求关机。…
+           "tool": { "type": "mcp", "mcpServer": …
+  修复后: ✓ 工具调用=pwsh(shutdown /s /t 0)，正文长度=0，reasoning 长度=110
+  ```
+  即：测试确实复现了用户报的症状，且修复把它转为通过。测试内另有一条断言确认样本本身
+  `JSON.parse` 必然抛错，保证测的确实是兜底路径。
+- `npm test` 全绿（config_check + smoke 27 组 + malformed 3 组）；活体回归 **17/17**
+  （守卫只在正文出现 ````json{` 时挂起，普通正文流式未受影响）；`/health` v0.5.4；正常回合 stderr 空。
+
+### 21.7 边界（如实入册）
+- 容错恢复是尽力而为：`args` 本身若也是非法 JSON，只能恢复工具名，参数退化空对象
+  （诊断行 `argsRecovered=false` 标明），后续由 `resolveDshToolCall` 兜底。
+- 守卫会**延迟**含 ````json{` 的正文块到围栏闭合才输出（内容原样到达）。
+  这是必要取舍：正文一旦流出就无法收回，而「先发后撤」在 SSE 上不可能。
+- 线上「模型再次吐畸形信封」无法按需触发，因此这条缺陷的证据链是
+  **线上日志（现象）+ 逐字符复制的样本（输入）+ 假上游重放（可重复判定）**，
+  而不是「等下一次线上偶发」。

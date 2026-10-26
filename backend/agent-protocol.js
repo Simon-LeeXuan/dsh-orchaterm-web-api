@@ -1083,3 +1083,254 @@ export function wrapToolResultInput(toolName, result) {
     : '{TOOL_RESULT}: '
   return `${tag}${String(result ?? '')}`
 }
+
+// ─────────────────────────────────────────────────────────────
+// 10. 畸形信封的容错恢复 + 跨帧围栏挂起
+// ─────────────────────────────────────────────────────────────
+//
+// 实测故障（session-dba58595 turn 8，用户："帮我关机，关闭电脑"）：
+// 模型把工具信封写成**非法 JSON** —— `thinking` 的值里带了未转义的 `"`：
+//   {"action":"review","thinking":"…但用户已经明确说"帮我关机，关闭电脑"，…","tool":{…}}
+// 于是 `parseToolEnvelope` 的 JSON.parse 整体失败，`server.js` 的兜底只能把**整包原文**
+// 当正文吐出：用户看到一大段 ```json，信封里的 execute_command 丢失，关机命令没被执行。
+// 现场特征：reasoning 恰好被截在未转义引号处（`…但用户已经明确说`），正文是整块围栏 JSON。
+//
+// 另外，正文侧的围栏拦截过去是**逐 delta** 匹配 ```` ```…``` ````，
+// 只要信封被切成多帧（线上很常见）就必然漏 —— 同一类症状的另一条来路。
+
+/**
+ * 从开引号处读一个 JSON 字符串值，**容忍值里未转义的引号**。
+ *
+ * 官方信封里的 `thinking` 经常直接内嵌中文引号或多余的双引号，严格 JSON 解析必死。
+ * 这里把「收尾引号」定义为后面跟 `,`/`}`/`]`（可隔空白）的那个引号 —— 散文里孤立出现的
+ * 引号后面通常不是这些字符，于是能被当作值的一部分继续读下去。
+ *
+ * @param {string} text
+ * @param {number} quoteIdx 开引号下标
+ * @returns {{value:string, end:number}} end 为收尾引号下标（未找到时等于 text.length）
+ */
+function scanJsonStringValue(text, quoteIdx) {
+  let out = ''
+  for (let i = quoteIdx + 1; i < text.length; i += 1) {
+    const ch = text[i]
+    if (ch === '\\') {
+      const next = text[i + 1]
+      out += next === 'n' ? '\n' : next === 't' ? '\t' : next === 'r' ? '\r' : next
+      i += 1
+      continue
+    }
+    if (ch === '"') {
+      const tail = text.slice(i + 1)
+      if (/^\s*[,}\]]/.test(tail) || /^\s*(?:```|$)/.test(tail)) return { value: out, end: i }
+      out += '"' // 值里的字面引号，继续读
+      continue
+    }
+    out += ch
+  }
+  return { value: out, end: text.length }
+}
+
+/**
+ * 取 `"key": "…"` 的字符串值（容忍未转义引号），只在 from 之后找第一个。
+ * @param {string} text
+ * @param {string} key
+ * @param {number} [from]
+ * @returns {{value:string, index:number}|null}
+ */
+function looseStringField(text, key, from = 0) {
+  const re = new RegExp(`"${key}"\\s*:\\s*"`, 'g')
+  re.lastIndex = from
+  const m = re.exec(text)
+  if (!m) return null
+  const quoteIdx = m.index + m[0].length - 1
+  return { value: scanJsonStringValue(text, quoteIdx).value, index: m.index }
+}
+
+/**
+ * 取 `"key": {…}` 的对象值并 JSON.parse。
+ *
+ * 花括号配平扫描是**字符串感知**的 —— args 本身通常是合法 JSON，所以这条路径可靠；
+ * 坏掉的是同一包里的 `thinking`，不影响 args。
+ *
+ * @param {string} text
+ * @param {string} key
+ * @param {number} [from]
+ * @returns {{value:object, index:number}|null} 解析失败返回 null
+ */
+function looseObjectField(text, key, from = 0) {
+  const re = new RegExp(`"${key}"\\s*:\\s*\\{`, 'g')
+  re.lastIndex = from
+  const m = re.exec(text)
+  if (!m) return null
+  const start = text.indexOf('{', m.index)
+  let depth = 0
+  let inString = false
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i]
+    if (inString) {
+      if (ch === '\\') i += 1
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') { inString = true; continue }
+    if (ch === '{') depth += 1
+    else if (ch === '}') {
+      depth -= 1
+      if (depth === 0) {
+        try {
+          const value = JSON.parse(text.slice(start, i + 1))
+          return value && typeof value === 'object' ? { value, index: m.index } : null
+        } catch {
+          return null
+        }
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * 从一个回合的原始正文里恢复工具信封 —— 严格解析失败时的兜底。
+ *
+ * 分层：
+ *   1. 严格 JSON（`parseToolEnvelope`）——正常回合走这条，绝大多数情况够用；
+ *   2. 宽松恢复：定位 `"tool"` 对象，用容忍未转义引号的取值器读出 `name`/`type`/`mcpServer`/
+ *      `description`/`args`，并顺带取回完整 `thinking`（供调用方把被打断的思考链改道回 reasoning）。
+ *
+ * 判据刻意收紧：**必须**同时拿到 `tool` 对象与其中的 `name` 才算恢复成功，
+ * 否则返回 null 让调用方原样放行 —— 宁可漏拦截，也不能把普通散文误吞成工具调用。
+ *
+ * @param {string} raw 本回合累积的原始正文（含可能的 ``` 围栏）
+ * @returns {{envelope:object, thinking:string, recovered:boolean, argsRecovered:boolean}|null}
+ */
+export function recoverToolEnvelope(raw) {
+  const text = String(raw ?? '')
+  if (text.trim() === '') return null
+
+  const strict = parseToolEnvelope(text)
+  if (strict) {
+    return {
+      envelope: strict,
+      thinking: typeof strict.thinking === 'string' ? strict.thinking : '',
+      recovered: false,
+      argsRecovered: true,
+    }
+  }
+
+  const toolAt = text.search(/"tool"\s*:\s*\{/)
+  if (toolAt === -1) return null
+  const nameHit = looseStringField(text, 'name', toolAt)
+  if (!nameHit || nameHit.value.trim() === '') return null
+
+  // 宽松路径必须再要一个「信封」证据：显式 action，或 tool 里的 args 对象。
+  // 真实信封两样必有其一；而散文里顺口提一句 `"tool": {…}` 通常两样都没有 ——
+  // 少这一道就会把普通回复误吞成工具调用（宁可漏拦截，不可误拦截）。
+  const actionHit = looseStringField(text, 'action')
+  const argsHit = looseObjectField(text, 'args', toolAt)
+  if (actionHit === null && argsHit === null) return null
+
+  const tool = { name: nameHit.value.trim() }
+  for (const key of ['type', 'mcpServer', 'description']) {
+    const hit = looseStringField(text, key, toolAt)
+    // 只接受落在 name 附近（同一 tool 对象内）的同名键，避免误取别处的字段。
+    if (hit && hit.index - toolAt < 800) tool[key] = hit.value
+  }
+  const argsRecovered = argsHit !== null
+  if (argsRecovered) tool.args = argsHit.value
+
+  const thinkingHit = looseStringField(text, 'thinking')
+  return {
+    envelope: { action: actionHit ? actionHit.value : 'review', tool },
+    thinking: thinkingHit ? thinkingHit.value : '',
+    recovered: true,
+    argsRecovered,
+  }
+}
+
+/**
+ * 跨帧围栏守卫：把正 body 里「疑似工具信封」的 fenced 块**挂起**到闭环再判定。
+ *
+ * 为什么必须有它：原来的实现是对**单个 delta** 做 ```` ```…``` ```` 正则匹配，
+ * 而线上信封会被切成几十帧 —— 逐帧匹配永远等不到同时含首尾围栏的那一帧，于是原始 JSON
+ * 直接流给用户。挂起期间不出字，闭环后把整块交给调用方判定（是信封就转工具调用，
+ * 不是就原样放行），所以**不会吞正文**。
+ *
+ * 放行护栏：块长超过 `maxHold` 立即放行（不无限占内存），`flush()` 也把挂起内容交还调用方。
+ *
+ * @param {{maxHold?:number}} [options]
+ */
+export function createEnvelopeFenceGuard(options = {}) {
+  const maxHold = Number(options.maxHold ?? 262144)
+  const OPEN_RE = /```(?:json)?\s*\{/
+  let held = ''
+  let bodyStart = -1
+  let holding = false
+
+  function closeBlock() {
+    const end = held.indexOf('```', bodyStart === -1 ? 0 : bodyStart)
+    if (end === -1) return null
+    const block = held.slice(0, end + 3)
+    const rest = held.slice(end + 3)
+    held = ''
+    bodyStart = -1
+    holding = false
+    return { block, rest }
+  }
+
+  /** 放弃挂起、把内容原样交还（超长护栏用）。 */
+  function releaseHeld() {
+    const release = held
+    held = ''
+    bodyStart = -1
+    holding = false
+    return release
+  }
+
+  return {
+    /** 是否正挂着一块未闭环的疑似信封。 */
+    holding: () => holding,
+
+    /**
+     * 喂一段正文。
+     * @returns {{emit:string, candidate:string|null}} emit 是可直接下发的正文；
+     *   candidate 是一个已闭环的 fenced 块原文（含围栏），交给 recoverToolEnvelope 判定。
+     */
+    feed(delta) {
+      const text = String(delta ?? '')
+      if (text === '') return { emit: '', candidate: null }
+
+      if (holding) {
+        held += text
+        const closed = closeBlock()
+        if (closed === null) {
+          if (held.length > maxHold) return { emit: releaseHeld(), candidate: null }
+          return { emit: '', candidate: null }
+        }
+        return { emit: closed.rest, candidate: closed.block }
+      }
+
+      const m = OPEN_RE.exec(text)
+      if (!m) return { emit: text, candidate: null }
+      const before = text.slice(0, m.index)
+      held = text.slice(m.index)
+      bodyStart = held.indexOf('{')
+      holding = true
+      const closed = closeBlock()
+      if (closed === null) {
+        // 单帧就超长（围栏之后再没出现收尾）→ 同样立即放弃，不必等下一帧。
+        if (held.length > maxHold) return { emit: `${before}${releaseHeld()}`, candidate: null }
+        return { emit: before, candidate: null }
+      }
+      return { emit: `${before}${closed.rest}`, candidate: closed.block }
+    },
+
+    /**
+     * 流收尾：把还挂着的块交还调用方判定（candidate），而不是直接丢弃或当成正文。
+     * @returns {{emit:string, candidate:string|null}}
+     */
+    flush() {
+      if (!holding) return { emit: '', candidate: null }
+      return { emit: '', candidate: releaseHeld() }
+    },
+  }
+}
