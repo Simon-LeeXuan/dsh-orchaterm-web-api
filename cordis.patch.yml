@@ -48,6 +48,9 @@
         # 工具结果回传信封：'review'（默认，桌面端在用的形态）| 'ask'（主循环模块 2481 的形态）。
         # 两种都经真实流量验证能被上游消费；逐轮可用请求体 orca_result_envelope 覆盖。
         resultEnvelope: 'review'
+        # 回传工具结果的「受理阶段」上限（官方 15e3）：只覆盖到「拿到响应头」，
+        # 不约束随后的流式答案（把它当 AbortSignal 挂在整个请求上会掐断正常作答，见 README）。
+        reportRetryTimeoutMs: 15000
         logFile: '~/.dsh/logs/orchaterm-web-api.log'
         detach: false
         killTreeOnDispose: true

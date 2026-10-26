@@ -49,7 +49,7 @@ import {
 } from './agent-protocol.js'
 import { redact, resolveCredentials, cookieHeaderFor, decodeJwtExp } from './credentials.js'
 
-export const VERSION = '0.5.4'
+export const VERSION = '0.5.5'
 
 /** 能力自述：插件的 contract.js 按这份清单决定是否复用已起的后端。 */
 export const CAPABILITIES = Object.freeze([
@@ -420,6 +420,11 @@ export function buildConfig(options = {}) {
     resultEnvelope: String(options.resultEnvelope || process.env.ORCA_RESULT_ENVELOPE || 'review').toLowerCase() === 'ask'
       ? 'ask'
       : 'review',
+    // 回传工具结果时「上游是否受理」的阶段上限（官方 15e3；0 = 不设上限）。
+    // ⚠️ 它只覆盖到拿到响应头，**不**约束随后的流式答案 —— 见 serveChat 里的长注释。
+    reportRetryTimeoutMs: Number.isFinite(Number(options.reportRetryTimeoutMs ?? process.env.ORCA_REPORT_RETRY_TIMEOUT_MS))
+      ? Math.max(0, Number(options.reportRetryTimeoutMs ?? process.env.ORCA_REPORT_RETRY_TIMEOUT_MS))
+      : REPORT_RETRY_TIMEOUT_MS,
   }
   // 凭据是桌面端登录态的**快照**：token 只有 ~2h 寿命，桌面端运行中会持续刷新 store。
   // 历史上多次出现「dsh web 报 Invalid or expired AccessToken、重启反代才恢复」，根因就是它。
@@ -664,24 +669,53 @@ async function serveChat(config, req, res, payload, round) {
   })
   const url = assistantQuery(config)
 
-  // 传输层重试。官方对 reportToolResult 的回传语义（@78376 + 模块 32804）：
-  // attempts=3、单次 15s 超时、退避 300→600ms（base*2^n 封顶 1500）。工具结果轮用官方参数，
-  // 普通轮维持既有的 3 次 / 600ms 固定退避。
+  // 传输层重试。官方对 reportToolResult 的回传语义（模块 32804 `SE` + 桌面 bundle 调用点）：
+  //   attempts=3, timeoutMs=15e3, operationName='回传工具结果', baseDelayMs=300, maxDelayMs=1500
+  //
+  // ⚠️ 官方那个 15s 是 `withTimeout` 包住一个 **Promise**：超时只「停止等待」并重试，
+  //    实现里只有 setTimeout + reject，**没有任何 AbortSignal**（错误文案也是
+  //    「回传工具结果 在 15000ms 内没有返回。」/「超时，已停止自动等待。」）。
+  //    早先本文件把它实现成 `AbortSignal.timeout(15s)` 挂在 fetch 上，等于给**整个 SSE body**
+  //    加了 15s 硬墙 —— 工具结果轮里模型正常作答（实测 reasoning 正在流）也会在第 15 秒被掐断，
+  //    DSH 侧表现为「本轮运行失败 orchaterm-web-api 错误: The operation was aborted due to timeout」，
+  //    内核再重试 2 次、每次都同样失败（实报：session-21bd31eb / session-8b10359d）。
+  //    正确口径：15s 只约束「上游是否受理这次回传」（拿到响应头）；头一到就撤表，
+  //    随后的流式答案交给 streamIdleTimeoutMs（180s 空闲判定）—— 那才是「流卡住」的判据。
   const isToolReport = round.reviewInput != null
+  const reportTimeoutMs = Math.max(0, Number(config.reportRetryTimeoutMs ?? REPORT_RETRY_TIMEOUT_MS) || 0)
   let upstream
   let lastFetchErr = null
   for (let attempt = 1; attempt <= 3; attempt += 1) {
-    const attemptSignal = isToolReport ? AbortSignal.timeout(REPORT_RETRY_TIMEOUT_MS) : undefined
+    // 受理阶段计时器：只覆盖到「拿到响应头」。0 = 不设这一阶段的上限。
+    const acceptCtrl = isToolReport && reportTimeoutMs > 0 ? new AbortController() : null
+    let acceptTimer = null
+    if (acceptCtrl) {
+      acceptTimer = setTimeout(() => {
+        acceptCtrl.abort(new Error(`回传工具结果 在 ${reportTimeoutMs}ms 内没有返回。`))
+      }, reportTimeoutMs)
+    }
+    const clearAcceptTimer = () => {
+      if (acceptTimer === null) return
+      clearTimeout(acceptTimer)
+      acceptTimer = null
+    }
+    // 客户端掐断信号（DSH 用户点停止）必须始终生效 —— 与受理计时器**合并**而不是互相覆盖
+    // （原先两个 `signal` 键写在同一对象里，后者会静默吃掉前者）。
+    const signals = [acceptCtrl?.signal, payload._signal].filter(Boolean)
     try {
       upstream = await fetch(url, {
         method: 'POST',
         headers: assistantHeaders(config, seqId),
         body: JSON.stringify(body),
-        ...(attemptSignal ? { signal: attemptSignal } : {}),
-        ...(payload._signal ? { signal: payload._signal } : {}),
+        ...(signals.length === 0 ? {} : { signal: signals.length === 1 ? signals[0] : AbortSignal.any(signals) }),
       })
+      // 头到了 = 上游已受理这次回传：撤掉受理计时器，别让它掐断后面的正文流。
+      clearAcceptTimer()
       if (upstream.ok || upstream.status < 500) break
+      // 5xx 也要按官方退避再试，不能立刻重发（原先这条分支直接落到下一轮、跳过了退避）。
+      if (attempt < 3) await new Promise((r) => setTimeout(r, reportRetryBackoffMs(attempt - 1)))
     } catch (error) {
+      clearAcceptTimer()
       lastFetchErr = error
       if (attempt < 3) {
         const delay = isToolReport ? reportRetryBackoffMs(attempt - 1) : 600
@@ -1146,10 +1180,30 @@ async function serveChat(config, req, res, payload, round) {
     }
   }
 
-  /** 泵一个 SSE body 到终止符或流结束（主流与续流共用）。 */
-  async function pumpStream(bodyReader) {
+  /**
+   * 泵一个 SSE body 到终止符或流结束（主流与续流共用）。
+   *
+   * @param {ReadableStreamDefaultReader} bodyReader
+   * @param {{idle?:boolean}} [options] `idle: true` 时对「两次 read 之间」加空闲上限
+   *   （config.streamIdleTimeoutMs）。续流要用它而不是给整个请求加墙钟上限 ——
+   *   同一个误移植模式（见上面回传重试的长注释）：一次正常的续流可能跑几分钟。
+   */
+  async function pumpStream(bodyReader, options = {}) {
+    const idleMs = options.idle === true ? Math.max(0, Number(config.streamIdleTimeoutMs) || 0) : 0
     for (;;) {
-      const { done, value } = await bodyReader.read()
+      let read
+      if (idleMs > 0) {
+        let timer = null
+        const idle = new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            reject(Object.assign(new Error(`续流空闲超过 ${idleMs}ms 没有数据`), { failureCode: 'TIMEOUT' }))
+          }, idleMs)
+        })
+        read = await Promise.race([bodyReader.read(), idle]).finally(() => clearTimeout(timer))
+      } else {
+        read = await bodyReader.read()
+      }
+      const { done, value } = read
       if (done) break
       buffer += decoder.decode(value, { stream: true })
       const lines = buffer.split('\n')
@@ -1173,16 +1227,17 @@ async function serveChat(config, req, res, payload, round) {
         const status = await assistantStreamStatus(config, round.conversationId)
         if (status?.status === 'running') {
           const resumeUrl = streamControlUrl(config, ASSISTANT_PATHS.streamResume, round.conversationId, { offset: String(frameCount) })
+          // 续流不设**墙钟**上限：它本来就是为「长跑的 Agent 流」准备的，60s 硬墙会掐掉正常续流
+          // （与回传 15s 是同一个误移植模式）。卡住与否交给读循环的空闲判定。
           const resumed = await fetch(resumeUrl, {
             method: 'GET',
             headers: assistantHeaders(config, seqId),
-            signal: AbortSignal.timeout(60000),
           })
           const resumeType = resumed.headers.get('content-type') || ''
           if (resumed.ok && resumeType.includes('event-stream') && resumed.body) {
             const resumeReader = resumed.body.getReader()
             try {
-              await pumpStream(resumeReader)
+              await pumpStream(resumeReader, { idle: true })
             } finally {
               try { await resumeReader.cancel() } catch { /* 已关闭 */ }
             }

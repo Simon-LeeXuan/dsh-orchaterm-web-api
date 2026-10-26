@@ -1,6 +1,6 @@
 {
   "name": "dsh-orchaterm-web-api",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "OrcaTerm (腾讯云或壳终端) 反代接入 DSH 模型选择器",
   "type": "module",
   "main": "lib/provider.js",
@@ -18,13 +18,14 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test/config_check.mjs && node test/smoke.mjs && node test/malformed_envelope.mjs",
+    "test": "node test/config_check.mjs && node test/smoke.mjs && node test/malformed_envelope.mjs && node test/report_timeout.mjs",
     "test:config": "node test/config_check.mjs",
     "test:smoke": "node test/smoke.mjs",
     "test:live": "node test/manual_live.mjs",
     "test:live:regression": "node test/live_regression.mjs",
     "install-plugin": "powershell -NoProfile -ExecutionPolicy Bypass -File ./install.ps1",
-    "test:malformed": "node test/malformed_envelope.mjs"
+    "test:malformed": "node test/malformed_envelope.mjs",
+    "test:report-timeout": "node test/report_timeout.mjs"
   },
   "keywords": [
     "dsh",

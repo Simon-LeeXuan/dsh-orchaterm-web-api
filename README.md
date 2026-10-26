@@ -140,7 +140,29 @@ cd C:\AITask\dsh-client-config\plugins\dsh-orchaterm-web-api
 A/B 验证能被上游正确消费**（同样问句下都能从结果里读出 `orchaterm-tool-probe` 并给出正确结论），
 所以这是「哪个更贴官方」的选择，不是「哪个能用」的选择。
 
-### 畸形信封的兜底（v0.5.4）
+### 工具结果轮的「受理超时」不是流超时（v0.5.5）
+
+官方回传工具结果用 `SE(() => 回传(), {attempts:3, timeoutMs:15e3, baseDelayMs:300, maxDelayMs:1500})`。
+关键在 `SE` 的实现（模块 32804）：它只是 `setTimeout` + `reject` 的 **promise 竞速**，用来
+「停止等待」并重试，**从不 abort 请求**（错误文案是「回传工具结果 在 15000ms 内没有返回。」）。
+
+v0.5.4 及之前把它实现成 `AbortSignal.timeout(15e3)` 挂在 `fetch` 上 —— 于是 15 秒变成了
+**整个 SSE body 的硬墙**：工具结果轮里模型正在正常作答，到第 15 秒连接被掐断，DSH 侧报
+`本轮运行失败 orchaterm-web-api 错误: The operation was aborted due to timeout`，内核再重试 2 次、
+每次都同样失败，整轮报废（实报：`session-21bd31eb`、`session-8b10359d`）。
+
+v0.5.5 按官方语义拆开两个阶段：
+
+| 阶段 | 判据 | 可配 |
+| --- | --- | --- |
+| 上游**是否受理**（等响应头） | `reportRetryTimeoutMs`（默认 15000），超时则按 300→600→1200ms 退避重试 3 次 | ✅ 0 = 不设上限 |
+| 正文**是否卡住**（已开始流） | `streamIdleTimeoutMs`（默认 180000）**空闲**判定 | ✅ |
+
+同理，断流续传 `/stream/resume` 也不再套 60s 墙钟上限，改用同一套空闲判定 —— 续流本来就是为
+长跑的 Agent 流准备的。两个 `signal` 现在用 `AbortSignal.any()` **合并**而不是互相覆盖
+（原先同对象里写两个 `signal:` 键，后者会静默吃掉前者，DSH 的「停止」可能失效）。
+
+---
 
 模型会把信封写成**非法 JSON**（实测：`thinking` 的值里带未转义的 `"`）。此时严格 `JSON.parse`
 整包失败，旧代码会退化成「整包原文当正文」——用户看到一大段 ```json，信封里的工具调用丢失。

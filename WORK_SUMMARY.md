@@ -990,3 +990,77 @@ st = (e,t)     => et({type: y.tw.ASK, input: $v(tool.name)(…, e)}, …)   // r
 - 线上「模型再次吐畸形信封」无法按需触发，因此这条缺陷的证据链是
   **线上日志（现象）+ 逐字符复制的样本（输入）+ 假上游重放（可重复判定）**，
   而不是「等下一次线上偶发」。
+
+---
+
+## 22. 「受理超时」被误实现成「掐断连接」（v0.5.5）
+
+### 22.1 用户实报
+`session-21bd31eb`、`session-8b10359d` 频繁出现
+`本轮运行失败 orchaterm-web-api 错误: The operation was aborted due to timeout`。
+
+### 22.2 现场（两个会话都要看，pointer 一致才敢定因）
+`session-21bd31eb` turn1/step2：pwsh 工具结果已成功回传（`isError=false`，len=3780），
+模型随后正常作答、reasoning 正在流（`诊断结果已出，核心问题非常明确：Windows 时间服务 (W32Time)…`），
+**第 15 秒被掐**：
+```
+usage  {inputTokens:13231, outputTokens:0}
+finish {kind:'error', failure:{message:'…The operation was aborted due to timeout', code:'SERVER', status:500}}
+```
+接着 `llm/retry` ×2（delay 1461ms、3373ms），**每次都死在同样的位置**，turn 以 error 收尾。
+
+`session-8b10359d`：turn 1 与 turn 2 各失败一次，且**两次都发生在有 `tool/result` 的步骤**上
+（`1/1`、`1/2` 有工具结果；失败轮的 `streamedChars=0` 或只有 reasoning 前缀）。
+两个会话的共同点收敛到一条：**工具结果轮 + 第 15 秒**。
+
+### 22.3 根因
+官方：`SE(() => 回传(), {attempts:3, timeoutMs:15e3, baseDelayMs:300, maxDelayMs:1500})`。
+`SE`（模块 32804）实现是 `setTimeout` + `reject` 的 **promise 竞速**，语义为「**停止等待**并重试」，
+**没有任何 AbortSignal**（错误文案：「回传工具结果 在 15000ms 内没有返回。」「…超时，已停止自动等待。」）。
+
+本插件 v0.5.4 及之前写成 `AbortSignal.timeout(REPORT_RETRY_TIMEOUT_MS)` 挂 `fetch` ——
+15s 从「受理上限」变成**整个 SSE body 的硬墙**。工具结果轮只要答案吐超过 15 秒，
+连接必被掐，内核重试也必在同样位置再被掐：**结构性整轮报废**，与模型、网络都无关。
+
+同类误移植还发现两处：
+1. `/stream/resume` 用 `AbortSignal.timeout(60000)` 挂在整个 fetch 上再 `pumpStream` ——
+   续流本就是为长跑的 Agent 流准备的，60s 墙钟会掐掉正常续流；
+2. 同一 `fetch` options 对象里写了两个 `signal:` 键（受理计时器 与 `payload._signal`），
+   **后者静默覆盖前者** —— DSH「点停止」与受理超时二者只有一个能生效。
+
+### 22.4 修法（对齐官方语义，不是放宽超时）
+| 阶段 | 判据 | 实现 |
+| --- | --- | --- |
+| 上游**是否受理**（等响应头） | `reportRetryTimeoutMs`（默认 15000，0=不限） | `AbortController` + `setTimeout`，**拿到响应头立即 clearTimeout** |
+| 正文**是否卡住**（已开流） | `streamIdleTimeoutMs`（默认 180000） | 读循环的空闲判定（原有） |
+| 两个信号 | 都要生效 | `AbortSignal.any([acceptCtrl.signal, payload._signal])` |
+
+另修 5xx 分支跳过官方退避的问题（原先 `upstream.ok || status < 500` 为假时直接进下一轮）。
+
+### 22.5 验证（先证明测试抓得住 bug）
+新增 `test/report_timeout.mjs`（假上游驱动，不需要登录态，接入 `npm test`）：
+1. **正文慢吐**：假上游立刻回头，正文分 6 片跨 2600ms（受理上限设 800ms）。断言正文完整、
+   无错误帧、`finish=stop`、假上游未看到提前断开；
+2. **受理真卡住**：假上游只收不答。断言受理超时**仍然生效**：502 +
+   「在 300ms 内没有返回。」+ 恰好 3 次尝试 + 总耗时约 1.9s（300ms×3 + 退避 300/600，与官方吻合）。
+
+**修复前 vs 修复后**（同一测试、同一份字节，只把 `signals` 临时换回 `AbortSignal.timeout(...)`）：
+```
+修复前: 正文="" finish=stop errors=["The operation was aborted due to timeout"]
+        AssertionError: 正文应完整送达，实际=""
+修复后: 正文="这是慢慢吐出来的结论正文。" finish=stop errors=[]
+```
+注意那句 `The operation was aborted due to timeout` —— **与用户报错逐字一致**，说明测试复现的就是线上那条路径。
+第 2 条用例保证修复没有把「真正的卡住」也一起放过（否则就是拿放宽超时掩盖问题）。
+
+`npm test` 全绿（config_check + smoke 27 + malformed 3 + report_timeout 2）；活体回归 **17/17**
+（含工具结果轮 C2 真实往返）；`/health` v0.5.5；正常回合 stderr 空。
+
+### 22.6 边界（如实入册）
+- 受理超时**不**限制整轮总时长：受理了却长时间不吐字，由 `streamIdleTimeoutMs`（180s 空闲）兜住。
+  这是刻意分工 —— 15s 只判断「这次回传有没有被接住」。
+- 重试仍可能重复投递同一份工具结果（官方同样 3 次尝试）。上游对重复 `reportToolResult`
+  是否幂等，无法从 bundle 侧证明，属既有边界，本轮未扩大。
+- 这条缺陷与 v0.5.2 的「回传重试官方参数」是**同一段代码的两面**：当时只对齐了数字
+  （attempts/timeout/退避），没对齐**语义**（停止等待 ≠ 掐断请求）。
+  教训入册：移植一个带超时的辅助函数时，必须读它的**实现**，不能只抄调用处的参数。

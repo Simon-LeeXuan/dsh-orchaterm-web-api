@@ -1,5 +1,66 @@
 All notable changes to the `dsh-orchaterm-web-api` plugin will be documented in this file.
 
+## [0.5.5] - 2026-10-27
+
+修一个**把官方的「停止等待」误移植成「掐断连接」**的缺陷（用户实报：
+`session-21bd31eb`、`session-8b10359d` 频繁出现
+`本轮运行失败 orchaterm-web-api 错误: The operation was aborted due to timeout`）。
+
+### 故障现场（会话日志逐事件核对）
+`session-21bd31eb` turn 1 step 2：pwsh 工具结果已成功回传（`isError=false`），接着模型开始正常作答，
+`assistant/attempt` 的 reasoning 正在流（`诊断结果已出，核心问题非常明确：Windows 时间服务 (W32Time)…`），
+**第 15 秒连接被掐断**：
+```
+usage {inputTokens:13231, outputTokens:0}
+finish  {kind:'error', failure:{message:'orchaterm-web-api 错误: The operation was aborted due to timeout', code:'SERVER', status:500}}
+```
+随后 `llm/retry` 重试 2 次（延迟 1461ms、3373ms），**每次都在同样的位置被掐断**，turn 以 error 结束。
+`session-8b10359d` 两轮 turn（1 与 2）都是同一形态，且都发生在**有 tool/result 的步骤**上。
+
+### Root cause
+官方回传工具结果：`SE(() => 回传(), {attempts:3, timeoutMs:15e3, baseDelayMs:300, maxDelayMs:1500})`。
+`SE`（模块 32804）的实现是 `setTimeout` + `reject` 的 **promise 竞速** —— 语义是「**停止等待**并重试」，
+**全程没有任何 AbortSignal**（错误文案亦为「回传工具结果 在 15000ms 内没有返回。」「…超时，已停止自动等待。」）。
+
+v0.5.4 及之前把它实现成 `AbortSignal.timeout(REPORT_RETRY_TIMEOUT_MS)` 挂在 `fetch` 上，
+于是 15 秒从「受理上限」变成了**整个 SSE body 的硬墙**：只要工具结果轮的答案吐超过 15 秒，
+连接就必然被掐，内核重试也必然在同样位置再被掐 —— 结构性地整轮报废。
+
+### Fixed
+- **受理超时与流超时拆开**：`reportRetryTimeoutMs`（默认 15000）只覆盖「等响应头」这一段，
+  拿到响应头立即撤销计时器；正文是否卡住交给 `streamIdleTimeoutMs`（默认 180000）的空闲判定。
+  新增可配项，`0` = 不设该阶段上限。
+- **两个 signal 合并而非覆盖**：原先同一对象里写了两个 `signal:` 键，后者静默吃掉前者
+  （`payload._signal` 覆盖了受理计时器，或反之）—— 现在用 `AbortSignal.any()` 合并，
+  DSH「点停止」与受理计时器都始终生效。
+- **5xx 也走官方退避**：原实现里 `upstream.ok || status < 500` 为假时直接落到下一轮，
+  跳过了 `reportRetryBackoffMs` 退避（与官方 300→600→1200ms 不符）。
+- **续流不再有 60s 墙钟上限**：`/stream/resume` 原先是 `AbortSignal.timeout(60000)` 挂在整个
+  fetch 上再 `pumpStream` —— 同一个误移植模式（续流本就是为长跑的 Agent 流准备的）。
+  改为 `pumpStream(reader, {idle:true})` 的空闲判定。
+
+### Added
+- `pumpStream(reader, {idle})`：可选空闲上限，主流与续流共用同一判据。
+- 配置项 `reportRetryTimeoutMs`（贯通 `DEFAULTS`/`MANAGER_KEYS`/`cordis.patch.yml`/provider env）。
+
+### Verified
+- **新增 `test/report_timeout.mjs`（已接入 `npm test`）**，假上游驱动、不需要登录态：
+  1. 假上游立刻回头、正文慢吐（2600ms，远超受理上限 800ms）→ 断言正文**完整送达**、
+     无错误帧、`finish=stop`、假上游未看到提前断开；
+  2. 假上游只收不答 → 断言受理超时**仍然生效**（502 + 「在 300ms 内没有返回。」+ 恰好重试 3 次 +
+     总耗时约 1.9s，与官方 300ms×3 + 退避 300/600 吻合）。
+- **先证明测试抓得住 bug**：把 `signals` 临时换回修复前的 `AbortSignal.timeout(reportTimeoutMs)`，
+  同一测试立刻报 `正文="" errors=["The operation was aborted due to timeout"]` ——
+  与用户看到的报错文案逐字一致；换回修复后转绿。
+- `npm test` 全绿（config_check + smoke 27 组 + malformed 3 组 + report_timeout 2 组）；
+  活体回归 **17/17**（含工具结果轮 C2）；`/health` v0.5.5；正常回合 stderr 空。
+
+### 边界
+- 受理超时**不**限制整轮总时长：若上游受理了却又长时间不吐字，由 `streamIdleTimeoutMs`
+  （180s 空闲）兜住，而不是 15s。这是刻意的 —— 15s 只该判断「这次回传有没有被接住」。
+- 重试仍可能重复投递工具结果（官方同样是 3 次尝试）。上游侧对同一 review 的重复
+  `reportToolResult` 是否幂等无法从 bundle 侧证明，属既有边界，未在本轮扩大。
+
 ## [0.5.4] - 2026-10-27
 
 修一个**信封漏进正文**的实报缺陷（用户点名：`session-dba58595` turn 8「帮我关机，关闭电脑」）。
