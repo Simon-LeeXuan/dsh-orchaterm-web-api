@@ -49,7 +49,7 @@ import {
 } from './agent-protocol.js'
 import { redact, resolveCredentials, cookieHeaderFor, decodeJwtExp } from './credentials.js'
 
-export const VERSION = '0.5.6'
+export const VERSION = '0.5.7'
 
 /** 能力自述：插件的 contract.js 按这份清单决定是否复用已起的后端。 */
 export const CAPABILITIES = Object.freeze([
@@ -152,15 +152,21 @@ function appendSpillHint(rawText) {
  * OpenAI messages → assistant 单轮输入（导出供单测；行为见内注）。
  *
  * @param {Array} messages OpenAI 形态消息数组
- * @param {{resultEnvelope?:'review'|'ask', askCallIds?:Set<string>}} [options]
+ * @param {{resultEnvelope?:'review'|'ask', askCallIds?:Set<string>, purpose?:string}} [options]
  *   `resultEnvelope` 选工具结果的回传信封：`'review'`（默认，官方子 Agent 循环形态）
  *   或 `'ask'`（官方主循环 `reportToolResult` 形态）；两者都以真实流量验证过，见 README。
  *   `askCallIds` 是「这些 callId 是上游提问信封」的集合 —— 它们的回传走 respondToAsk。
+ *   `purpose` 是本轮的用途（宿主给辅助调用打的标，如 `'compaction'`）。
  */
 export function toAssistantInput(messages, options = {}) {
   const list = Array.isArray(messages) ? messages : []
   const resultEnvelope = options.resultEnvelope === 'ask' ? 'ask' : 'review'
   const askCallIds = options.askCallIds instanceof Set ? options.askCallIds : null
+  // 压缩摘要轮：待压缩的对话 + 一条压缩指令，**不是**工具结果轮、也不是对未决
+  // 工具调用的反馈。它必须走普通 start 路径 —— review/feedback 两种形态都不带
+  // historyMessages（见 assistantBody），上游就看不到待压缩的对话，摘要必然与
+  // 对话无关。宿主把压缩摘要作为 purpose='compaction' 的辅助调用发出。
+  const isCompaction = options.purpose === 'compaction'
 
   // 找到最后一个 assistant 消息的索引
   let lastAssistantIdx = -1
@@ -260,7 +266,7 @@ export function toAssistantInput(messages, options = {}) {
     }
   }
 
-  if (isToolTurn) {
+  if (isToolTurn && !isCompaction) {
     // 上游的**提问**不是工具执行结果，回程要用官方 respondToAsk（模块 2481 `at`）：
     // `{type:'ask', input:<用户答复原文>}`。整批都是提问时才走这条；混批按工具结果处理。
     if (results.length > 0 && results.every((r) => r.isAsk)) {
@@ -309,7 +315,7 @@ export function toAssistantInput(messages, options = {}) {
     ? list[lastAssistantIdx].tool_calls
     : []
   const feedbackText = currentParts.join('\n\n')
-  if (pendingCalls.length > 0 && feedbackText) {
+  if (pendingCalls.length > 0 && feedbackText && !isCompaction) {
     const firstCall = pendingCalls[0]
     const origTool = ORIG_TOOL_BY_CALL.get(firstCall?.id)
       ?? reconstructOrcaTool(firstCall?.function?.name || 'pwsh', firstCall?.function?.arguments || '{}')
@@ -617,6 +623,10 @@ async function handleChat(config, req, res) {
   const { content, history, type, toolResultText, reviewInput } = toAssistantInput(payload.messages, {
     resultEnvelope,
     askCallIds: askCallIdsOf(payload.messages),
+    // 压缩摘要轮：provider 逐轮标注本轮用途（宿主给辅助调用打的 purpose）。
+    // 后端据此走普通 start 路径并带上 historyMessages —— 待压缩的对话必须到上游，
+    // 否则摘要与对话无关（见 toAssistantInput 的 isCompaction 说明）。
+    purpose: typeof payload.orca_purpose === 'string' ? payload.orca_purpose : '',
   })
   // 本轮是否发历史：默认不发（上游会回灌污染正文）；但调用方做「上下文对账」后判定需要
   // 补发时（换新会话同步 DSH 的压缩结果）可以逐轮覆盖 —— provider 传 orca_send_history。

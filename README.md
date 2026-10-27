@@ -245,7 +245,30 @@ npm run test:malformed         # 只跑畸形信封回归（假上游驱动，�
 
 `host_live_switch.spec.ts` 更进一步：宿主的摘要是用**上一个模型**做的，所以上个模型是
 orcaterm 路由时，摘要请求会原样经过插件适配器打到**真实 OrcaTerm 上游** ——
-契约缺陷若还在，这一步就会崩。
+契约缺陷若还在，这一步就会崩；摘要与对话无关的缺陷也会在这里暴露
+（断言「摘要正文含待压缩对话的内容」+「上游只被调用一次」）。
+
+`compaction_summary.mjs` 是**假上游驱动**的确定性回归（不需要登录态）：它按
+OrcaTerm 的 SSE 方言回话，同时**记录上游到底收到了什么**，断言压缩轮确实带了
+`historyMessages`、且里面是待压缩对话的内容。
+
+### 压缩摘要轮的特殊处理（v0.5.7）
+
+宿主的上下文压缩把摘要作为**辅助 LLM 调用**（`purpose: 'compaction'`）发出，消息体是
+「待压缩的那段对话 + 一条压缩指令」。**待压缩的对话本身就是输入** —— 若上游只收到那条
+指令，产出的摘要与对话完全无关（实测 161 字的元话，零事实），宿主拿它与被压缩内容
+比大小就会判失败，模型切换因此以 `MODEL_SWITCH_COMPACTION_FAILED` 收尾。
+
+所以压缩轮与普通轮不同：
+
+| | 普通轮 | 压缩摘要轮 |
+| --- | --- | --- |
+| 上游会话 | 按上下文对账决定（fresh/continue/resync） | **每次新会话**（官方形态 `cid-{uuid}-{assistant}`，真随机） |
+| 补发历史 | 按对账结果（默认不补发） | **总是补发** |
+| 请求体标记 | 无 | `orca_purpose: 'compaction'` + `orca_send_history: true` |
+| 后端路径 | 视消息形态（start / review / feedback） | 强制 **start**（review 与 feedback 两种形态都不带 `historyMessages`） |
+
+普通轮的行为完全没变。
 
 `live_regression.mjs` 覆盖五段：回放剥离 → 工具信封 → 工具结果被接受 → **provider 契约（DSH 原生 `tool-call`/`tool` 消息）** → **上下文对账（fresh/continue/resync）**；
 结束时会把本轮下发的真实命令打印出来，便于在本机直接执行确认「确实跑了」。

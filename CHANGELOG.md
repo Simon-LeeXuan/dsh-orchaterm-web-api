@@ -1,5 +1,73 @@
 All notable changes to the `dsh-orchaterm-web-api` plugin will be documented in this file.
 
+## [0.5.7] - 2026-10-27
+
+修「压缩摘要与对话无关」——模型切换时的上下文压缩因此失败（`MODEL_SWITCH_COMPACTION_FAILED`）。
+
+### Root cause
+宿主的压缩摘要是**辅助 LLM 调用**（`purpose: 'compaction'`），消息体是
+「待压缩的那段对话 + 一条压缩指令」。但反代默认**不补发历史**
+（`sendHistoryMessages` 默认 false），上游于是**只收到最后那条压缩指令** ——
+它根本没见过要压缩的对话，产出的摘要与对话无关：
+
+| 上游实际收到的 | 摘要实测 |
+| --- | --- |
+| 只有压缩指令 | 161~191 字元话（「已按您指定的 Markdown 结构完成对话压缩检查点输出」），零事实 |
+| 压缩指令 + 对话历史 | 999~1140 字，逐字复述对话里的事实（SHM 锁 / 8793 端口 / SQLite WAL） |
+
+宿主随后拿摘要与被压缩内容比大小：无关的元话不比内容短 → 报
+`summary is not smaller than the shadowed content`；摘要为空 → 报
+`summarization produced no text summary content`。两者都让模型切换以
+`MODEL_SWITCH_COMPACTION_FAILED` 收尾。
+
+两个叠加原因：
+
+1. **对账判 `fresh` → 不补发历史**。压缩请求走独立的 `aux:compaction:<sessionId>` 会话键，
+   第一次必然判 `fresh`，而 `fresh` 不补发历史（`lib/context.js` 的语义：历史会被上游
+   回灌成 `ai` 帧污染正文）。于是**第一次压缩必然拿到无内容的摘要**；宿主重试时判定变成
+   `resync` 才补发历史 —— 修复前要靠「失败→重试」才成功（两次上游调用）。
+2. **压缩轮可能被误判成「对未决工具调用的反馈」**。区域末尾那条 assistant 带 `tool_calls`
+   时，后端会走 `feedback` 形态；而 `assistantBody` 的 review 分支**根本不带
+   `historyMessages`** → 历史第二次丢失。
+
+### Fix
+- `lib/provider.js`：压缩轮（`purpose === 'compaction'`）**每次新会话 + 补发历史**，
+  并绕开上下文对账（对账的 `fresh/resync` 语义在这里没有意义）。会话 id 用真随机的一段
+  （官方形态 `cid-{uuid}-{assistant}`）—— 常规会话那套「会话键的稳定哈希」不够：
+  上游服务端会留着旧会话，摘要里会掺进上一次压缩的旧内容（实测摘要出现过
+  「最近标记为 user 3」这种上一轮的痕迹）。
+- `lib/provider.js`：请求体带上 `orca_purpose`，把「本轮用途」告诉后端。
+- `backend/server.js`：`orca_purpose === 'compaction'` 时走**普通 `start` 路径**，
+  避开 review / feedback 两个不带 `historyMessages` 的分支。
+- 普通轮的行为**完全不变**：不发 `orca_purpose`、不补发历史、对账逻辑照旧。
+
+### Added
+- `test/compaction_summary.mjs`：假上游断言「上游到底收到了什么」。
+  ① 压缩轮必须带 `historyMessages` 且含待压缩对话的具体内容；
+  ② 区域末尾 assistant 带 `tool_calls` 时也不得走 feedback 形态；
+  ③ 非压缩轮行为不变；④ provider 侧压缩轮必须「新会话 + 补发历史」；
+  ⑤ provider 发出的请求体必须带 `orca_send_history` 与 `orca_purpose`。
+- `test/host_live_switch.spec.ts`：真实上游的模型切换压缩（宿主完整栈）。
+
+### Verified
+- **先证明测试抓得住 bug**：在真实宿主上把 provider 的压缩分支还原，
+  同一份测试立刻失败，摘要正文变成
+  「当前会话无实际运维任务需要处理。上下文仅包含：1）将对话压缩为结构化检查点的系统指令；
+  2）执行环境说明……」—— 与对话完全无关。
+- 修复后同一测试：模型切换放行、压缩检查点写入、摘要正文正确描述对话内容、
+  **上游调用次数 = 1**（修复前需 2 次）。
+- `npm test` 全绿（config_check + smoke 28 组 + malformed 3 组 + report_timeout 2 组 +
+  compaction_summary 5 组）。
+
+### 边界（如实入册）
+- 上游 token 的 TTL 约 **2 小时**，来自 OrcaTerm 桌面端登录态。插件的
+  `ensureFreshCredential` 只能**重读桌面端 store**，不能自己续期 —— 过期后需要
+  重启 OrcaTerm 桌面端（2026-10-27 12:56 那次就是这样恢复的）。
+- 压缩摘要的**长度**仍由上游模型决定。宿主的护栏要求摘要严格短于被压缩内容；
+  区域极小（例如被保留的尾巴本身就超过阈值）时，任何符合宿主 7 段结构的摘要都不可能
+  更短 —— 那是宿主的内容护栏与「保留尾巴/阈值」的组合，不是本插件的缺陷。
+- 本轮仍只修「上游看到什么」。压缩**区域如何选**、**阈值怎么算**属宿主策略，未改。
+
 ## [0.5.6] - 2026-10-27
 
 修一个**宿主适配器契约面缺失**的实报缺陷（用户粘贴）：
