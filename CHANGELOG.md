@@ -1,5 +1,96 @@
 All notable changes to the `dsh-orchaterm-web-api` plugin will be documented in this file.
 
+## [0.5.6] - 2026-10-27
+
+修一个**宿主适配器契约面缺失**的实报缺陷（用户粘贴）：
+`Cannot switch to orcaterm-web-api/hy4-preview: context compaction failed:
+this.adapters.get(...)?.adapter.imageRequestPricing is not a function.`
+（`orcaterm-web-api/glm-5.3-flash` 同样报；错误码 `MODEL_SWITCH_COMPACTION_FAILED`，
+伴随重复的「处理失败」与 `compact`）
+
+### Root cause
+本插件的适配器是**普通 JS 类** —— 插件按约定只在 `lib/kernel.js` 里惰性 import
+`@deepseek-ai/dsh-llm`（取归因头），拿不到 `LlmAdapter` **基类**，于是基类上的
+**默认实现全部缺失**。而宿主 `LlmRuntime` 是**直接调用注册对象上的方法**的：
+
+```ts
+// packages/llm/llm/src/index.ts
+imageRequestPricing(provider, model) {
+  return this.adapters.get(provider)?.adapter.imageRequestPricing(provider, model)  // ← 682 行
+}
+imageRequestTarget(provider, model, image) {
+  return this.registration(provider).adapter.imageRequestTarget(provider, model, image)  // ← 693 行
+}
+```
+
+缺方法不是「降级为 undefined」，而是 **TypeError**。宿主链路：
+
+```
+agent/request（模型切换，prepend）
+  → compactPressure(agent, header)
+    → token-meter measure(session, header)
+      → _routeImagePricing(header)                       // token-meter/src/index.ts:202
+        → ctx.llm.imageRequestPricing(provider, model)
+          → adapter.imageRequestPricing(...)             // ← 适配器没这个方法 → TypeError
+  → 包装成 LlmError('MODEL_SWITCH_COMPACTION_FAILED')
+```
+
+`registerAdapter()` 只做鸭子类型校验（`providerInfo` / `providerRetryPolicy`），
+**不检查其余方法**，所以缺方法能一路溜到运行时才炸。
+
+### Fixed
+- **补齐宿主契约面**（等价移植基类默认实现，见 `lib/provider.js`）：
+  - `imageRequestPricing(_provider, _model)` → `undefined`。本路由不按视觉 token 收费
+    （上游是腾讯侧计费的助手网关，客户端拿不到每模型视觉单价），「声明无计价器」正是
+    基类默认语义：token-meter 退回中性估算，spill-policy 遇图片时抛错并保持内联内容。
+  - `imageRequestTarget(_provider, _model, image)` → `{width, height, maxBytes: image.bytes}`。
+    本路由不缩放图片，保留归一化后的原图。
+- **顺带修 `resolveModel` 的签名错配**：宿主契约是 `resolveModel(provider, model, signal)`，
+  第三参是 **AbortSignal**；原先把它当**配置对象**用（`opts.maxContextWindow` /
+  `opts.defaultMaxTokens`）。宿主直接调用时拿到的是 signal，这两个值全是 `undefined`
+  → 上下文窗口退到 128000 兜底值（而不是目录里申报的 1M），压缩线随之失准。
+  现在配置一律从 `this.current()` 取，signal 只用于提前放弃。
+
+### Added
+- `test/smoke.mjs` 第 5b 组「宿主适配器契约面完整」：逐个断言宿主会直接调用的方法存在，
+  并断言 `imageRequestPricing` 返回 `undefined`、`imageRequestTarget` 保留原图尺寸、
+  `resolveModel` 在**传 signal** 时仍申报目录里的上下文窗口（1M / 300K / 128K）。
+- `test/host_contract.spec.ts`：宿主侧契约回归（真实 `LlmRuntime` + `TokenMeter` +
+  `BasicCompactionEngine` + 插件真实适配器），复刻实报的模型切换压缩失败。
+- `test/host_live_switch.spec.ts` + `test/direct-fetch.mjs`：**真实上游**的模型切换压缩。
+  宿主的摘要用「上一个模型」做（compaction-basic/src/summarizer.ts:127），所以上个模型是
+  orcaterm 路由时，摘要请求会原样经过插件适配器打到真实 OrcaTerm 上游。
+  `direct-fetch.mjs` 绕开本机的 `NODE_USE_ENV_PROXY`（宿主的 vitest setup 会删掉 `NO_PROXY`，
+  而 Node 的 fetch 在进程启动时已绑死代理 → 本地 8793 的请求被送进代理 → `fetch failed`）。
+
+### Verified
+- **先证明测试抓得住 bug**：在**真实宿主**上删掉 `imageRequestPricing`，
+  同一测试立刻逐字复现用户报错：
+  ```
+  Cannot switch to orcaterm-web-api/hy4-preview: context compaction failed:
+  this.adapters.get(...)?.adapter.imageRequestPricing is not a function.
+  The previous request model is preserved; retry or select a model with a larger context window.
+  ```
+  修复后该路径**完全无错**（模型切换成功，压缩照常完成）。
+- **真实上游活体验证通过**：摘要请求经插件适配器打到真实 OrcaTerm 上游并拿回摘要
+  （真实往返 8~23 秒），全程无契约类错误。
+- `npm test` 全绿（config_check + smoke 28 组 + malformed 3 组 + report_timeout 2 组）。
+- 活体回归 **17/17**（真实 OrcaTerm 会话：思维链、工具调用、工具结果回传、上下文对账）。
+- 其余 9 个插件均不注册 adapter（`grep registerAdapter` 仅本插件一处），无同类隐患。
+
+### 边界
+- 本路由的 `inputModalities` 仍申报 `image`（目录如此），但反代的 OpenAI 消息格式化
+  （`lib/openai.js` 的 `flattenContent`）**丢弃非文本 block** —— 图片在到达上游前就被丢掉。
+  这是既有的能力申报与实际能力之间的落差，不在本轮修复范围内；如需如实申报，
+  下一步应把 `image` 从各模型的 `inputModalities` 里去掉，或补上图片透传。
+- **新发现（未修）**：OrcaTerm 上游在「压缩摘要」这个用途上不稳定 —— 实测同一场景下
+  出现过两种结局：`summary is not smaller than the shadowed content`（摘要比被压缩内容还长）
+  与 `summarization produced no text summary content`（摘要为空）。两者都是**上游模型的
+  内容表现**与宿主内容护栏的组合，不是契约缺陷（契约缺陷已修，且这两条文案证明请求确实
+  到了上游）。但它们会让「模型切换 + 长历史」的压缩轮以 `MODEL_SWITCH_COMPACTION_FAILED`
+  收尾。宿主自带路由（`llm-deepseek`）不受影响，因为它用的是确定性的脚本化摘要。
+  本轮如实入册，未扩大范围。
+
 ## [0.5.5] - 2026-10-27
 
 修一个**把官方的「停止等待」误移植成「掐断连接」**的缺陷（用户实报：

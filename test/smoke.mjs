@@ -83,6 +83,54 @@ assert.equal(resolved.provider, PROVIDER_ID)
 assert.ok(resolved.context.contextWindow > 0)
 assert.ok(resolved.defaultMaxTokens > 0)
 
+console.log('5b. 验证宿主适配器契约面完整（实报：imageRequestPricing is not a function）...')
+{
+  // 宿主 LlmRuntime 直接调用注册对象上的这些方法（packages/llm/llm/src/index.ts）。
+  // 插件的适配器是普通 JS 类（拿不到 LlmAdapter 基类），基类默认实现全部缺失，
+  // 缺一个就会在压缩/模型切换时炸掉 —— 这里逐个对齐宿主实际会调的方法。
+  const REQUIRED = [
+    'providerInfo',
+    'providerRetryPolicy',
+    'imageRequestPricing',
+    'imageRequestTarget',
+    'listModels',
+    'resolveModel',
+    'prepareCall',
+  ]
+  for (const method of REQUIRED) {
+    assert.equal(
+      typeof adapterInstance[method],
+      'function',
+      `适配器缺少宿主必需方法 ${method}()`,
+    )
+  }
+
+  // imageRequestPricing：本路由不按视觉 token 收费 → 声明「无计价器」是基类默认语义。
+  assert.equal(adapterInstance.imageRequestPricing(PROVIDER_ID, 'deepseek-v4.1-flash'), undefined)
+
+  // imageRequestTarget：不缩放图片，保留归一化后的原图（与基类默认实现一致）。
+  const imageRef = { attachmentId: 'att-1', mediaType: 'image/png', bytes: 2048, width: 640, height: 480 }
+  assert.deepEqual(
+    adapterInstance.imageRequestTarget(PROVIDER_ID, 'deepseek-v4.1-flash', imageRef),
+    { width: 640, height: 480, maxBytes: 2048 },
+  )
+
+  // resolveModel 的第三参是 AbortSignal，不是配置对象（实修的签名错配）。
+  // 宿主传 signal 时，目录里申报的上下文窗口必须照常生效，而不是退到兜底值。
+  const viaSignal = await adapterInstance.resolveModel(PROVIDER_ID, 'hy4-preview', new AbortController().signal)
+  assert.equal(viaSignal.context.contextWindow, 1048576, 'hy4-preview 应申报 1M 上下文')
+  const viaModel = await adapterInstance.resolveModel(PROVIDER_ID, 'glm-5.3-flash', new AbortController().signal)
+  assert.equal(viaModel.context.contextWindow, 300000, 'glm-5.3-flash 应申报 300K 上下文')
+
+  // 已取消的 signal 应立刻放弃，而不是继续解析。
+  const aborted = new AbortController()
+  aborted.abort()
+  await assert.rejects(
+    () => adapterInstance.resolveModel(PROVIDER_ID, 'hy4-preview', aborted.signal),
+    /aborted/,
+  )
+}
+
 console.log('6. 验证问候语剥离 (createGreetingStripper)...')
 {
   // 分片模拟打字机流：问候语被吃掉，正文放行

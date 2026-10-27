@@ -164,6 +164,51 @@ v0.5.5 按官方语义拆开两个阶段：
 
 ---
 
+### 适配器必须自己实现 LlmAdapter 的全部方法（v0.5.6）
+
+本插件的适配器是**普通 JS 类**，不是 `LlmAdapter` 的子类 —— 插件按约定只在
+`lib/kernel.js` 里惰性 import `@deepseek-ai/dsh-llm`（取归因头），不引宿主包，
+因此**拿不到基类上的默认实现**。
+
+而宿主 `LlmRuntime` 是**直接调用注册对象上的方法**的：
+
+```ts
+// packages/llm/llm/src/index.ts
+imageRequestPricing(provider, model) {
+  return this.adapters.get(provider)?.adapter.imageRequestPricing(provider, model)   // 682
+}
+imageRequestTarget(provider, model, image) {
+  return this.registration(provider).adapter.imageRequestTarget(provider, model, image)  // 693
+}
+```
+
+缺方法不是「降级为 undefined」，而是 **TypeError**。实报（模型切换时）：
+
+```
+Cannot switch to orcaterm-web-api/hy4-preview: context compaction failed:
+this.adapters.get(...)?.adapter.imageRequestPricing is not a function.
+```
+
+链路：模型切换 → `compactPressure` → token-meter `measure()` → `ctx.llm.imageRequestPricing()`
+→ 适配器没这个方法 → TypeError → `MODEL_SWITCH_COMPACTION_FAILED`。
+
+`registerAdapter()` 只校验 `providerInfo` / `providerRetryPolicy`，**不检查其余方法**，
+所以缺方法能一路溜到运行时才炸。宿主会直接调用的方法共 7 个，插件必须全部实现：
+
+| 方法 | 本插件的实现 |
+| --- | --- |
+| `providerInfo(provider)` | ✅ `{id, name}` |
+| `providerRetryPolicy(provider)` | ✅ 路由级重试策略 |
+| `listModels(provider)` | ✅ 后端 `/v1/models` + 静态目录兜底 |
+| `resolveModel(provider, model, **signal**)` | ✅ 第三参是 **AbortSignal**（曾被误当配置对象用） |
+| `prepareCall(provider, model, signal)` | ✅ |
+| `imageRequestPricing(provider, model)` | ✅ 返回 `undefined`（本路由不按视觉 token 收费） |
+| `imageRequestTarget(provider, model, image)` | ✅ 保留归一化后的原图（不缩放） |
+
+`test/smoke.mjs` 第 5b 组与 `test/host_contract.spec.ts`（宿主侧端到端）守着这张表。
+
+---
+
 模型会把信封写成**非法 JSON**（实测：`thinking` 的值里带未转义的 `"`）。此时严格 `JSON.parse`
 整包失败，旧代码会退化成「整包原文当正文」——用户看到一大段 ```json，信封里的工具调用丢失。
 v0.5.4 用两层守卫兜住：
@@ -181,12 +226,26 @@ v0.5.4 用两层守卫兜住：
 ## 验证
 
 ```powershell
-npm test                       # 离线：cordis/DEFAULTS 静态校验 + 27 组 smoke + 3 组畸形信封回归（见下）
+npm test                       # 离线：cordis/DEFAULTS 静态校验 + 28 组 smoke + 3 组畸形信封回归 + 2 组受理超时回归（见下）
 npm run test:live:regression   # 活体：需反代在跑 + 有效登录态，17 项断言，会让模型真发工具调用
 npm run test:malformed         # 只跑畸形信封回归（假上游驱动，不需要登录态）
 # 凭据说明（v0.3.3）：token 临期/过期时反代自动重读 OrcaTerm 桌面端登录态，并在认证失败时自动重试一次；
 # 只要桌面端开着就不用再手动重启反代。桌面端没开且 token 过期时报 AUTH 属预期。
+# 宿主侧契约回归（v0.5.6）：两份 spec 都需要在宿主仓库根目录跑 ——
+#   cd C:\AITask\deepseek-harness
+#   Copy-Item <插件>\test\host_contract.spec.ts packages\compaction\compaction-basic\tests\
+#   npx vitest run packages/compaction/compaction-basic/tests/host_contract.spec.ts
+#   （host_live_switch.spec.ts 同理；它会真打上游，需要反代在跑 + 有效登录态）
 ```
+
+`host_contract.spec.ts` 是**跨仓库**的哨兵：它用真实 `LlmRuntime` + `TokenMeter` +
+`BasicCompactionEngine` 加载**插件的真实适配器**，复刻实报的「模型切换 → 上下文压缩 →
+图片计价解析」失败链。宿主升级导致契约漂移时，插件自己的离线测试未必能发现
+（它只断言方法存在，不走宿主调用链），这份能。
+
+`host_live_switch.spec.ts` 更进一步：宿主的摘要是用**上一个模型**做的，所以上个模型是
+orcaterm 路由时，摘要请求会原样经过插件适配器打到**真实 OrcaTerm 上游** ——
+契约缺陷若还在，这一步就会崩。
 
 `live_regression.mjs` 覆盖五段：回放剥离 → 工具信封 → 工具结果被接受 → **provider 契约（DSH 原生 `tool-call`/`tool` 消息）** → **上下文对账（fresh/continue/resync）**；
 结束时会把本轮下发的真实命令打印出来，便于在本机直接执行确认「确实跑了」。

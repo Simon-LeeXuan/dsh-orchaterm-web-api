@@ -1064,3 +1064,117 @@ finish {kind:'error', failure:{message:'…The operation was aborted due to time
 - 这条缺陷与 v0.5.2 的「回传重试官方参数」是**同一段代码的两面**：当时只对齐了数字
   （attempts/timeout/退避），没对齐**语义**（停止等待 ≠ 掐断请求）。
   教训入册：移植一个带超时的辅助函数时，必须读它的**实现**，不能只抄调用处的参数。
+
+---
+
+## 23. 宿主适配器契约面缺失 → 模型切换必炸（v0.5.6）
+
+### 23.1 用户实报
+```
+Cannot switch to orcaterm-web-api/hy4-preview: context compaction failed:
+this.adapters.get(...)?.adapter.imageRequestPricing is not a function.
+The previous request model is preserved; retry or select a model with a larger context window.
+code = MODEL_SWITCH_COMPACTION_FAILED
+```
+`orcaterm-web-api/glm-5.3-flash` 同样报；伴随重复的「处理失败」与 `compact`。
+
+### 23.2 根因：插件拿不到 `LlmAdapter` 基类
+插件按约定只在 `lib/kernel.js` 里惰性 import `@deepseek-ai/dsh-llm`（取归因头），
+**不引宿主包** → 适配器是**普通 JS 类** → **基类上的默认实现全部缺失**。
+
+而宿主 `LlmRuntime` 是**直接调用注册对象上的方法**的（不是「有没有就调，没有就跳过」）：
+```ts
+// packages/llm/llm/src/index.ts:682 / 693
+this.adapters.get(provider)?.adapter.imageRequestPricing(provider, model)
+this.registration(provider).adapter.imageRequestTarget(provider, model, image)
+```
+缺方法 ⇒ **TypeError**（不是降级为 undefined）。
+
+完整失败链：
+```
+agent/request（模型切换，prepend）
+  → compactPressure(agent, header)                       compaction-basic/src/index.ts:190
+    → token-meter measure(session, header)
+      → _routeImagePricing(header)                        token-meter/src/index.ts:202
+        → ctx.llm.imageRequestPricing(provider, model)
+          → adapter.imageRequestPricing(...)  ← 方法不存在 → TypeError
+  → 包装成 LlmError('MODEL_SWITCH_COMPACTION_FAILED')     compaction-basic/src/index.ts:195
+```
+
+`registerAdapter()` 只校验 `providerInfo` / `providerRetryPolicy`（llm/src/index.ts:445-450），
+**不检查其余方法** —— 所以缺方法能一路溜到运行时才炸。这就是「注册成功 ≠ 契约完整」。
+
+### 23.3 为什么以前没炸
+`imageRequestPricing` 只在**图片计价**与**模型切换压缩**两条路上被调用；
+普通对话轮不压缩、不带图片，于是这个洞一直潜伏着，直到用户去切模型才暴露。
+
+### 23.4 修法（等价移植基类默认实现）
+| 方法 | 实现 | 依据 |
+| --- | --- | --- |
+| `imageRequestPricing(_provider, _model)` | `undefined` | 本路由不按视觉 token 收费（上游是腾讯侧计费的助手网关，客户端拿不到每模型视觉单价）；「声明无计价器」正是基类默认语义 |
+| `imageRequestTarget(_provider, _model, image)` | `{width, height, maxBytes: image.bytes}` | 本路由不缩放图片，保留归一化后的原图 |
+
+`undefined` 的下游语义（查证过，不是猜）：
+- token-meter：`priceSurface()` 见到 `pricing === undefined` 就退回固定启发式估算（route-pricing.ts:37-46）；
+- spill-policy：遇到图片且拿不到计价器 → 抛错 → catch 里 `keeping the inline content`，
+  即**保持内联内容**（spill-policy/src/index.ts:67 + 129）。
+
+顺带修 **`resolveModel` 的签名错配**：宿主契约是 `resolveModel(provider, model, signal)`，
+第三参是 **AbortSignal**；原先把它当**配置对象**用（`opts.maxContextWindow` /
+`opts.defaultMaxTokens`）。宿主直接调用时这两个值全是 `undefined` →
+上下文窗口退到 128000 兜底值（而不是目录里申报的 1M）→ 压缩线随之失准。
+现在配置一律从 `this.current()` 取，signal 只用于提前放弃。
+
+### 23.5 验证（先证明测试抓得住 bug）
+新增 `test/host_contract.spec.ts`：用**真实宿主** `LlmRuntime` + `TokenMeter` +
+`BasicCompactionEngine` 加载**插件真实适配器**，复刻实报的失败链。
+
+**修复前 vs 修复后**（同一份字节，只把 `imageRequestPricing` 临时删掉）：
+```
+修复前: code = MODEL_SWITCH_COMPACTION_FAILED
+        message = Cannot switch to orcaterm-web-api/hy4-preview: context compaction failed:
+                  this.adapters.get(...)?.adapter.imageRequestPricing is not a function.
+                  The previous request model is preserved; retry or select a model with a larger context window.
+修复后: code = undefined / message = undefined / cause = undefined   ← 模型切换完全成功
+```
+那句 `this.adapters.get(...)?.adapter.imageRequestPricing is not a function`
+**与用户报错逐字一致**，说明测试复现的就是线上那条路径。
+
+另有 `test/smoke.mjs` 第 5b 组（插件内离线）：断言宿主会直接调用的 7 个方法都存在，
+且 `resolveModel` 在**传 signal** 时仍申报目录里的上下文窗口（1M / 300K / 128K）。
+
+### 23.5.1 真实上游活体验证
+`test/host_live_switch.spec.ts`：宿主的摘要是用**上一个模型**做的
+（`compaction-basic/src/summarizer.ts:127` `latest = agent.session.requestHeader()?.config`），
+所以上个模型是 orcaterm 路由时，摘要请求会**原样经过插件适配器**打到真实上游。
+实测：真实往返 8~23 秒，摘要确实回来了，全程无契约类错误。
+
+环境坑（记录下来，免得下次再踩）：宿主 vitest 的 setup 会删掉 `NO_PROXY` 等代理变量，
+而 Node 的内置 fetch 在**进程启动时**就把代理配置绑死了 —— 于是连 `127.0.0.1:8793`
+的本地请求也被送进代理，表现为 `TypeError: fetch failed`。
+解法是测试内把 `globalThis.fetch` 换成 `node:http` 直连实现（`test/direct-fetch.mjs`）；
+后端进程自己的上游调用不在本进程内，不受影响。
+
+`npm test` 全绿（config_check + smoke 28 + malformed 3 + report_timeout 2）；活体回归 **17/17**。
+
+### 23.6 边界（如实入册）
+- 本路由的 `inputModalities` 仍申报 `image`，但反代的 OpenAI 消息格式化
+  （`lib/openai.js` 的 `flattenContent`）**丢弃非文本 block** —— 图片在到达上游前就被丢掉。
+  能力申报与实际能力之间的落差，属既有问题，本轮未扩大（如实申报应去掉 `image`，
+  或补图片透传）。
+- **新发现（未修，如实入册）**：OrcaTerm 上游在「压缩摘要」这个用途上不稳定 —— 同一场景
+  实测出现过两种结局：
+  - `summary is not smaller than the shadowed content (137 estimated framed tokens >= 134)`
+  - `summarization produced no text summary content`
+  两者都是**上游模型的内容表现**撞上宿主的内容护栏（`region.ts:418` 要求摘要的 framed
+  token 数严格小于被遮蔽内容），不是契约缺陷 —— 这两条文案本身就证明请求到了上游。
+  但它们会让「模型切换 + 长历史」的压缩轮以 `MODEL_SWITCH_COMPACTION_FAILED` 收尾。
+  宿主自带路由（`llm-deepseek`）不受影响：它用确定性的脚本化摘要。
+  可能的解法（未实施）：给 orcaterm 路由配一个确定性的摘要策略，或在压缩前先把历史
+  压到「摘要必然更短」的规模。
+- 其余 9 个插件均不注册 adapter（`grep registerAdapter` 仅本插件一处），无同类隐患。
+- 教训入册：**注册成功 ≠ 契约完整**。宿主鸭子类型校验只查入口方法，
+  其余方法缺失会潜伏到特定运行时路径（这里是「模型切换 + 压缩」）才炸。
+  对「不继承基类的适配器」，必须逐个对照宿主 `LlmAdapter` 的方法表实现，
+  并在**真实宿主**上跑一遍调用链验证 —— 只在插件里 mock 宿主不足以发现这类洞。
+
