@@ -1,5 +1,58 @@
 All notable changes to the `dsh-orchaterm-web-api` plugin will be documented in this file.
 
+## [0.5.8] - 2026-10-27
+
+修「映射会话被上游卡死后永久零输出」——DSH 侧表现为 `EMPTY_RESPONSE`
+（「orchaterm-web-api 这一轮没有产出任何内容（检查 OrcaTerm 是否仍登录、账号额度是否用尽）」）
+重试 2 次后整轮失败，点「继续」也无济于事。
+
+### Root cause
+实报 session-628db98d（2026-10-27 会话日志逐帧核对）：上游对同一 `conversationId` 的
+会话上下文涨到 ~32k 后开始 **200 + 零输出**（provider 侧 `inputTokens≈32500` 计入、
+`outputTokens` 恒 0，且失败得很快——不是超时），此后该 cid 的每一轮、**换模型**
+（glm-5.3-flash → hy3）都零输出。同时间窗实测对照：
+
+| 请求形态 | 结果 |
+| --- | --- |
+| 卡死 cid 上的任意轮（含换模型后） | 200 + 零输出，秒回 |
+| 最小请求（新会话，几 KB） | 正常 |
+| 新会话 + 127KB 大输入 | 正常，19s |
+
+→ **卡死的是上游按 cid 保存的会话状态**，不是账号（登录态/额度正常）、不是模型、
+不是后端进程（一直存活）。
+
+宿主每轮都带同一个 cid（provider 的会话映射 `payload.user`），反代按 cid 去重只发
+增量（`DELIVERED.textsFor`）——旧 cid 一旦被上游卡死就永远救不回来，桌面端那个会话
+没有任何自愈路径。流式侧已有的「断流续传」（`/stream/resume`）只覆盖「单条流没走完」，
+覆盖不了「上游对整个会话持续零输出」。
+
+### Fix
+- `backend/server.js`（serveChat 零输出救援）：流结束**零正文、零推理、零工具调用**
+  且上游正常收尾（`[DONE]` 或无终止符）时——判定与 provider 的 `EMPTY_RESPONSE` 同
+  口径——若本轮 cid 是宿主映射来的：abort 掉旧 cid 可能残留的僵尸流，**换全新会话 +
+  补发全量历史**（与压缩摘要轮同款模式）重入一次。工具结果信封（review/ask/feedback）
+  引用旧会话的调用 id，新会话认不得，降级为普通 `start`，工具结果文本并入 `input`；
+  换新会话后上游不再按 cid 保留首轮上下文，系统提示以 `[系统要求]` 前缀随本轮补上
+  （对齐首轮形态，已在 content 里就不重复）。救援后新会话也零输出则维持原样交 DSH
+  （`EMPTY_RESPONSE` 兜底仍在，不无限重试）。
+- `backend/server.js`（handleChat）：记住「旧 cid → 救援会话」映射（内存 LRU 64 条，
+  进程重启丢失后由零输出检测重新发现），后续轮次直接用救援会话——不再先撞一次注定
+  零输出的旧 cid，也不重复补发历史。
+- 救援留痕到后端 stderr（`会话 <cid> 本轮零输出…已换新会话 <cid2> 补发历史重试`），
+  排障时「这一轮为什么多了两次上游调用」有处可查。
+
+### Verification
+- 新增 `test/empty_response_rescue.mjs`（离线，假上游，**先证明测试抓得住 bug**：
+  修复前第一组即红 `救援后应有正文，实际 ""`）。三组：带 `[DONE]` 的零输出、不带
+  `[DONE]`（先走断流续传检查再救援）、救援后下一轮 remap；断言救援轮「换新会话 +
+  补发历史（含系统要求）+ 降级 start + abort 僵尸流」。修复后三组全绿。
+  （测试隔离注意：`RESCUED_CID`/`DELIVERED` 是模块级记忆，每组要用独立的卡死 cid。）
+- 既有离线回归全绿：smoke（27 组）、compaction_summary（5 组）、malformed_envelope、
+  report_timeout、config_check、direct-fetch；新测试已加入 `npm test` 链。
+- 真栈回归 `test/live_regression.mjs`（8793，真桌面端 + 有效登录态）：**17/17 通过**。
+- 部署：后端由 `lib/server.js` 的 supervisor 托管，进程退出即清空 health 缓存，
+  下一次插件请求自动用新代码重启（无空窗）。
+
 ## [0.5.7] - 2026-10-27
 
 修「压缩摘要与对话无关」——模型切换时的上下文压缩因此失败（`MODEL_SWITCH_COMPACTION_FAILED`）。

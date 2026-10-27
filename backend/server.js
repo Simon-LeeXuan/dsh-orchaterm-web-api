@@ -49,7 +49,7 @@ import {
 } from './agent-protocol.js'
 import { redact, resolveCredentials, cookieHeaderFor, decodeJwtExp } from './credentials.js'
 
-export const VERSION = '0.5.7'
+export const VERSION = '0.5.8'
 
 /** 能力自述：插件的 contract.js 按这份清单决定是否复用已起的后端。 */
 export const CAPABILITIES = Object.freeze([
@@ -549,6 +549,12 @@ export function ensureFreshCredential(config) {
 /** 会话级「已交付正文」记忆：喂给重复剥离器，防同一段正文在下一轮再露一次脸。 */
 const DELIVERED = createDeliveredHistory()
 
+/** 零输出救援的会话映射：宿主映射的旧 cid → 救援时启用的新 cid。
+ * 只在「上游对旧 cid 持续零输出」时记录（见 serveChat 的零输出救援）；
+ * 进程重启丢失后由零输出检测重新发现，无需持久化。 */
+const RESCUED_CID = new Map()
+const RESCUED_CID_MAX = 64
+
 /** 本机 POSIX shell（Git Bash / WSL 等）：用来承接上游按 Linux 主机写出来的命令。 */
 const POSIX_SHELL = resolvePosixShell()
 
@@ -634,7 +640,10 @@ async function handleChat(config, req, res) {
   // 官方 generateConversationId（模块 72535）：`cid-{id}` + `-{assistant}`（assistant≠lighthouse）
   // + `-{mode}`（mode≠0）。orcaterm 的 assistant 名不是 lighthouse、mode 0 = RE_ACT，
   // 所以官方会话 ID 形如 `cid-<uuid>-orcaterm` —— 这里对齐同一形态。
-  const conversationId = req.headers['x-orca-conversation-id'] || payload.user || `cid-${newSeqId()}-orcaterm`
+  // 零输出救援的记忆：宿主映射的 cid 一旦被上游卡死（持续零输出），后续轮次直接换用
+  // 救援会话，不再先撞一次注定零输出的旧 cid —— 见 serveChat 的零输出救援。
+  const hostCid = String(req.headers['x-orca-conversation-id'] || payload.user || '')
+  const conversationId = RESCUED_CID.get(hostCid) || hostCid || `cid-${newSeqId()}-orcaterm`
   const wantStream = payload.stream === true
 
   return serveChat(config, req, res, payload, {
@@ -645,6 +654,7 @@ async function handleChat(config, req, res) {
     reviewInput,
     sendHistory,
     conversationId: String(conversationId),
+    cidFromHost: hostCid !== '',
     wantStream,
   })
 }
@@ -1282,6 +1292,51 @@ async function serveChat(config, req, res, payload, round) {
       pushDelta({ content: greetingOnly })
       emittedText = greetingOnly
     }
+  }
+
+  // ── 零输出救援：映射会话被上游卡死时的自动恢复 ─────────────────────
+  // 实测（session-628db98d，2026-10-27）：上游对同一 conversationId 的会话上下文涨到
+  // ~32k 后开始 200 + 零输出（此后该 cid 每一轮、换模型都零输出，DSH 侧
+  // EMPTY_RESPONSE 重试 2 次后整轮失败）；同一时间窗内新会话（哪怕 127KB 大输入）
+  // 完全正常 —— 卡死的是上游按 cid 保存的会话状态，不是账号、不是模型。
+  // 宿主每轮都带同一个 cid（provider 的会话映射），本代理按 cid 去重只发增量，
+  // 所以旧 cid 一旦卡死就永远救不回来。处理：abort 掉旧 cid 可能残留的僵尸流，
+  // 换全新会话 + 补发全量历史（与压缩摘要轮同款模式）重入一次；工具结果信封
+  // （review/ask/feedback）引用旧会话的调用 id，新会话认不得，降级为普通 start，
+  // 工具结果文本并入 input —— 历史里已带上下文，语义不丢。
+  // 判定与 provider 的 EMPTY_RESPONSE 同口径：零正文、零推理、零工具调用，且上游
+  // 正常收尾（[DONE] 或无终止符）—— [ERROR]/[ABORTED] 是真实上游错误，已照实透出。
+  if (round.cidFromHost === true && round.rescueRetried !== true && !clientGone
+    && emittedText.trim() === '' && reasoning.trim() === '' && toolCalls === 0
+    && (terminal === 'done' || terminal === null)) {
+    void assistantAbort(config, round.conversationId)
+    const rescuedCid = `cid-${newSeqId()}-orcaterm`
+    if (RESCUED_CID.size >= RESCUED_CID_MAX) RESCUED_CID.delete(RESCUED_CID.keys().next().value)
+    RESCUED_CID.set(round.conversationId, rescuedCid)
+    warnLine(`会话 ${round.conversationId} 本轮零输出（上游疑似卡死该会话），已换新会话 ${rescuedCid} 补发历史重试`)
+    // 换新会话后上游不再按 cid 保留首轮上下文，系统提示必须随本轮补上
+    // （对齐首轮的 [系统要求] 前缀形态；已在 content 里就不再重复）。
+    let rescueSystemText = ''
+    for (const m of Array.isArray(payload.messages) ? payload.messages : []) {
+      if (m?.role === 'system' || m?.role === 'developer') {
+        const t = typeof m?.content === 'string' ? m.content : ''
+        if (t) rescueSystemText = t
+      }
+    }
+    const baseContent = round.content || round.toolResultText || '请继续'
+    const sysPrefix = rescueSystemText && !baseContent.includes(rescueSystemText)
+      ? `[系统要求] ${rescueSystemText}\n\n`
+      : ''
+    return serveChat(config, req, res, payload, {
+      ...round,
+      conversationId: rescuedCid,
+      sendHistory: true,
+      content: sysPrefix + baseContent,
+      reviewInput: undefined,
+      toolResultText: undefined,
+      type: undefined,
+      rescueRetried: true,
+    })
   }
 
   // 记进会话级「已交付正文」：下一轮开头若原样重放这段，重复剥离器负责吃掉。
