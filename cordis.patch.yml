@@ -31,6 +31,14 @@
         assistantCookies: ''
         uin: ''
         skey: ''
+        # AccessToken 自续期（v0.6.0）：'auto'（默认，临期自动续 + 5 分钟巡检）| 'off'。
+        # 官方动作 OAuthRefreshToken；只要曾经登录过一次，之后不必一直开着 OrcaTerm 客户端。
+        tokenRefresh: 'auto'
+        # 续期结果缓存（含一枚 bearer token，0600 落盘）。默认 ~/.dsh/orca-token-cache.json。
+        tokenCache: ''
+        # 距过期不足 10 分钟就提前续期；后台每 5 分钟巡检一次（对齐桌面端 TokenManager）。
+        tokenRefreshLeadMs: 600000
+        tokenRefreshCheckMs: 300000
         autoStart: true
         startTimeoutMs: 20000
         probeTimeoutMs: 3000

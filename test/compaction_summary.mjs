@@ -213,7 +213,7 @@ console.log('5. provider 发出的请求体必须带 orca_send_history 与 orca_
       res.end(JSON.stringify({
         status: 'ok',
         version: '0.0.0-test',
-        capabilities: ['openai-chat-completions', 'orca-cgi-passthrough', 'health-self-description'],
+        capabilities: ['openai-chat-completions', 'orca-cgi-passthrough', 'health-self-description', 'token-self-refresh'],
         credential: { cgiReady: true, assistantReady: true },
       }))
       return

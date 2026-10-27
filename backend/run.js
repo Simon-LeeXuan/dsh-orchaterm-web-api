@@ -28,7 +28,7 @@ function argv(flags) {
   return out
 }
 
-const options = argv(['port', 'host', 'cgi-base', 'assistant-base', 'assistant', 'mode', 'model', 'credentials', 'token', 'uin', 'skey', 'assistant-cookies', 'client-identity'])
+const options = argv(['port', 'host', 'cgi-base', 'assistant-base', 'assistant', 'mode', 'model', 'credentials', 'token', 'uin', 'skey', 'assistant-cookies', 'client-identity', 'token-refresh', 'token-cache', 'token-refresh-lead-ms', 'token-refresh-check-ms', 'token-refresh-cooldown-ms', 'token-refresh-timeout-ms'])
 
 const config = {
   port: options.port ? Number(options.port) : undefined,
@@ -46,6 +46,13 @@ const config = {
   sendHistoryMessages: options['send-history'] === true,
   // 'desktop'（默认）或 'web'：以哪个客户端的身份访问上游。
   clientIdentity: options['client-identity'],
+  // AccessToken 自续期：'auto'（默认）| 'off'；以及缓存路径/阈值（见 backend/token-refresh.js）。
+  tokenRefresh: options['token-refresh'],
+  tokenCache: options['token-cache'],
+  tokenRefreshLeadMs: options['token-refresh-lead-ms'],
+  tokenRefreshCheckMs: options['token-refresh-check-ms'],
+  tokenRefreshCooldownMs: options['token-refresh-cooldown-ms'],
+  tokenRefreshTimeoutMs: options['token-refresh-timeout-ms'],
 }
 
 const handle = await startServer(config)

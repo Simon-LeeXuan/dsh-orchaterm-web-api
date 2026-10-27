@@ -47,9 +47,22 @@ import {
   recoverToolEnvelope,
   createEnvelopeFenceGuard,
 } from './agent-protocol.js'
-import { redact, resolveCredentials, cookieHeaderFor, decodeJwtExp } from './credentials.js'
+import {
+  applyAccessToken,
+  cookieHeaderFor,
+  decodeJwtExp,
+  redact,
+  resolveCredentials,
+  tokenCachePath,
+} from './credentials.js'
+import {
+  DEFAULT_REFRESH_CHECK_MS,
+  DEFAULT_REFRESH_LEAD_MS,
+  createTokenRefresher,
+  tokenRemainingMs,
+} from './token-refresh.js'
 
-export const VERSION = '0.5.8'
+export const VERSION = '0.6.0'
 
 /** 能力自述：插件的 contract.js 按这份清单决定是否复用已起的后端。 */
 export const CAPABILITIES = Object.freeze([
@@ -57,6 +70,8 @@ export const CAPABILITIES = Object.freeze([
   'orca-cgi-passthrough',
   'health-self-description',
   'assistant-sse',
+  // AccessToken 自续期（OAuthRefreshToken）：旧构建缺这项，凭据过期就再也救不回来。
+  'token-self-refresh',
 ])
 
 /**
@@ -378,12 +393,33 @@ class AssistantUnavailableError extends Error {
  * @param {object} options
  */
 export function buildConfig(options = {}) {
+  // 自续期开关：'auto'（默认）| 'off'。关掉就退回 v0.5.x 的「只重读桌面端登录态」行为。
+  const refreshEnabled = String(
+    options.tokenRefresh ?? process.env.ORCA_TOKEN_REFRESH ?? 'auto',
+  ).toLowerCase() !== 'off'
+  const cachePath = tokenCachePath(options.tokenCache || process.env.DSH_ORCA_TOKEN_CACHE || '')
+  const numberOpt = (value, fallback) => {
+    const num = Number(value)
+    return Number.isFinite(num) ? Math.max(0, num) : fallback
+  }
+  const refreshLeadMs = numberOpt(
+    options.tokenRefreshLeadMs ?? process.env.ORCA_TOKEN_REFRESH_LEAD_MS,
+    DEFAULT_REFRESH_LEAD_MS,
+  )
+  const refreshCheckMs = numberOpt(
+    options.tokenRefreshCheckMs ?? process.env.ORCA_TOKEN_REFRESH_CHECK_MS,
+    DEFAULT_REFRESH_CHECK_MS,
+  )
   const credentialOpts = {
     credentialsFile: options.credentialsFile || process.env.DSH_ORCA_CREDENTIALS || '',
     token: options.token || '',
     cookies: options.cookies || process.env.ORCA_COOKIES || '',
     uin: options.uin || '',
     skey: options.skey || '',
+    tokenCache: cachePath,
+    // 测试注入：允许把「桌面端登录态」指到临时文件，避免读到真机凭据。
+    ...(options.storePath ? { storePath: options.storePath } : {}),
+    ...(options.cookiesPath ? { cookiesPath: options.cookiesPath } : {}),
   }
   const credential = options.credential || resolveCredentials(credentialOpts)
   // 显式 cookie 串（assistantCookies）优先于 jar：assistant 只吃 uin/skey 那对。
@@ -432,11 +468,63 @@ export function buildConfig(options = {}) {
       ? Math.max(0, Number(options.reportRetryTimeoutMs ?? process.env.ORCA_REPORT_RETRY_TIMEOUT_MS))
       : REPORT_RETRY_TIMEOUT_MS,
   }
-  // 凭据是桌面端登录态的**快照**：token 只有 ~2h 寿命，桌面端运行中会持续刷新 store。
-  // 历史上多次出现「dsh web 报 Invalid or expired AccessToken、重启反代才恢复」，根因就是它。
-  // ensureFreshCredential 在临期/过期时调用这里重读桌面端登录态（两次文件读）。
+
+  // 凭据是**快照**：token 只有 ~2h 寿命。v0.6.0 起不再依赖桌面端替我们续期 ——
+  // 后端自己用官方 CGI 动作 `OAuthRefreshToken` 换新（见 token-refresh.js）：
+  //   · 到期前 10 分钟主动续；后台每 5 分钟巡检一次（对齐桌面端 TokenManager）；
+  //   · 认证类报错时强制续一次再重试；
+  //   · 成功的 token 落盘到 ~/.dsh/orca-token-cache.json，进程重启也不丢。
+  config.tokenRefreshEnabled = refreshEnabled
+  config.tokenCachePath = cachePath
+  config.tokenRefreshLeadMs = refreshLeadMs
+  config.tokenRefreshCheckMs = refreshCheckMs
+  const refresher = refreshEnabled
+    ? createTokenRefresher(config, {
+      cachePath,
+      leadMs: refreshLeadMs,
+      cooldownMs: numberOpt(options.tokenRefreshCooldownMs ?? process.env.ORCA_TOKEN_REFRESH_COOLDOWN_MS, 30000),
+      timeoutMs: numberOpt(options.tokenRefreshTimeoutMs ?? process.env.ORCA_TOKEN_REFRESH_TIMEOUT_MS, 15000),
+    })
+    : null
+  config.tokenRefresher = refresher
+  // cgiCall 在响应头里看到 X-OT-Token-Refreshed 时回调这里（服务端滑动续期）。
+  config.absorbServerToken = refresher ? (jwt) => refresher.absorb(jwt) : () => false
+
+  // 本地重读桌面端登录态（两次文件读，零网络）。桌面端在跑时通常已经替我们续过了。
   config.refreshCredential = () => {
-    config.credential = resolveCredentials(credentialOpts)
+    let next
+    try {
+      next = resolveCredentials(credentialOpts)
+    } catch {
+      return config.credential
+    }
+    // 不允许把手里更鲜活的 token 换回更旧的：并发续期 + 缓存写失败时，
+    // 「本地重读」可能只看到桌面端的旧值，直接覆盖等于把刚续好的 token 丢掉。
+    const current = config.credential
+    const currentToken = current?.token || ''
+    const currentExp = decodeJwtExp(currentToken)
+    if (currentToken === '' || decodeJwtExp(next.token) >= currentExp) {
+      config.credential = next
+    } else {
+      const merged = { ...next, assistantBearer: current.assistantBearer || currentToken }
+      config.credential = applyAccessToken(merged, currentToken, { keepAssistantBearer: true })
+    }
+    return config.credential
+  }
+  // 认证失败路径：先重读本地，再无脑强制续一次（不看冷却、不看剩余时间）。
+  config.forceRefreshCredential = async () => {
+    try {
+      config.refreshCredential()
+    } catch {
+      // 本地文件读失败不该挡住网络续期
+    }
+    if (config.tokenRefresher) {
+      try {
+        await config.tokenRefresher.ensureFresh({ force: true, reason: 'auth-error' })
+      } catch {
+        // 续期失败保持旧凭据，由调用方照常报认证错误
+      }
+    }
     return config.credential
   }
   return config
@@ -530,19 +618,45 @@ function reconstructOrcaTool(dshName, argsText) {
 }
 
 /**
- * 凭据临期/过期时重读桌面端登录态。
+ * 凭据临期/过期时把它弄新：先本地重读，再向官方 `OAuthRefreshToken` 换新。
  *
- * 判据：token 的 exp 无法解析（=0），或距过期不足 120s。健康时零 IO；
- * 桌面端没开时重读到的仍是旧值，行为不会更差。
+ * 判据：剩余寿命未知（exp 解析不出），或距过期不足 `tokenRefreshLeadMs`（默认 10 分钟）。
+ * 健康时零 IO、零网络；续期失败只记一行诊断，仍用现有凭据（调用方照常拿到真实报错）。
  *
  * @param {object} config buildConfig 的产物
- * @returns {object} 当前应使用的 credential（可能是刚刷新的）
+ * @returns {Promise<object>} 当前应使用的 credential（可能是刚续期/刚重读的）
  */
-export function ensureFreshCredential(config) {
-  if (typeof config.refreshCredential !== 'function') return config.credential
-  const token = config.credential.token || config.credential.assistantBearer || ''
-  const exp = decodeJwtExp(token)
-  if (exp === 0 || exp < Date.now() + 120000) return config.refreshCredential()
+export async function ensureFreshCredential(config) {
+  if (!config || typeof config !== 'object') return config?.credential
+  const lead = Number.isFinite(Number(config.tokenRefreshLeadMs))
+    ? Number(config.tokenRefreshLeadMs)
+    : DEFAULT_REFRESH_LEAD_MS
+  if (tokenRemainingMs(config.credential) > lead) return config.credential
+
+  // 1) 本地重读：桌面端如果正在跑，往往已经替我们续过了（零网络）。
+  if (typeof config.refreshCredential === 'function') {
+    try {
+      config.refreshCredential()
+    } catch {
+      // 登录态文件不可读：继续走网络续期
+    }
+  }
+  if (tokenRemainingMs(config.credential) > lead) return config.credential
+
+  // 2) 官方续期动作（OAuthRefreshToken）。关掉就退回 v0.5.x 的纯重读行为。
+  if (config.tokenRefreshEnabled === false || typeof config.tokenRefresher?.ensureFresh !== 'function') {
+    return config.credential
+  }
+  const outcome = await config.tokenRefresher.ensureFresh({})
+  if (outcome && outcome.ok === false && outcome.skipped !== 'cooldown') {
+    // 同一类失败只吵一次（比如从没登录过 OrcaTerm 时，巡检每 5 分钟都会 NO_TOKEN）。
+    if (config._lastRefreshWarnCode !== outcome.code) {
+      config._lastRefreshWarnCode = outcome.code
+      warnLine(`AccessToken 续期失败（${outcome.code}）：${outcome.message}；本轮先用现有凭据`)
+    }
+  } else if (outcome?.ok === true) {
+    config._lastRefreshWarnCode = ''
+  }
   return config.credential
 }
 
@@ -562,8 +676,8 @@ const POSIX_SHELL = resolvePosixShell()
 const ENV_PROMPT = describeExecutionHost({ posixShell: POSIX_SHELL })
 
 async function handleModels(config, res) {
-  // token 临期/过期时先重读桌面端登录态，再发 CGI（模型目录拿不到默认项不致命，但没必要白发错凭据）。
-  ensureFreshCredential(config)
+  // token 临期/过期时先续期（本地重读 → OAuthRefreshToken），再发 CGI。
+  await ensureFreshCredential(config)
   // 两次 CGI 并发：串行时冷启动要 5s+，会把上层「拿不到就回落静态清单」的超时吃掉。
   const [byo, setting] = await Promise.all([
     cgiCall(config, 'DescribeAIModelList', {}),
@@ -605,9 +719,9 @@ async function handleChat(config, req, res) {
   const payload = await readJson(req)
   if (payload === null) return json(res, 400, { error: { message: '请求体不是合法 JSON', type: 'invalid_request_error' } })
 
-  // token 临期/过期时先重读桌面端登录态：历史上「Invalid or expired AccessToken」的根源
-  // 就是代理启动后一直揣着过期快照。这里刷新失败也只会走到下面的 assistantReady 检查。
-  ensureFreshCredential(config)
+  // token 临期/过期时先续期：历史上「Invalid or expired AccessToken」的根源就是
+  // 代理启动后一直揣着过期快照。续期失败也只会走到下面的 assistantReady 检查。
+  await ensureFreshCredential(config)
 
   if (!config.credential.assistantReady) {
     // 上游会原话回 NEED_UIN_AND_SKEY；提前判定避免一次无效外发。
@@ -731,6 +845,8 @@ async function serveChat(config, req, res, payload, round) {
       })
       // 头到了 = 上游已受理这次回传：撤掉受理计时器，别让它掐断后面的正文流。
       clearAcceptTimer()
+      // 服务端滑动续期：任何已认证响应都可能回一枚新 token（官方 onServerTokenRefreshed）。
+      config.absorbServerToken?.(upstream.headers.get('x-ot-token-refreshed'))
       if (upstream.ok || upstream.status < 500) break
       // 5xx 也要按官方退避再试，不能立刻重发（原先这条分支直接落到下一轮、跳过了退避）。
       if (attempt < 3) await new Promise((r) => setTimeout(r, reportRetryBackoffMs(attempt - 1)))
@@ -757,10 +873,10 @@ async function serveChat(config, req, res, payload, round) {
       const parsed = JSON.parse(raw)
       message = parsed?.message || parsed?.error?.message || message
     } catch { /* 原样透出 */ }
-    // 认证类错误（如桌面端刚刷新了 token、我们还在用旧的）：重读登录态重试一次。
+    // 认证类错误（如 token 刚过期、上游刚换了新值）：强制续期后重试一次。
     // 此处响应头还没写过（上面所有分支都走 json()），重入是安全的。
     if (AUTH_ERROR_RE.test(message) && round.authRetried !== true) {
-      config.refreshCredential?.()
+      await config.forceRefreshCredential?.()
       return serveChat(config, req, res, payload, { ...round, authRetried: true })
     }
     const code = /NEED_UIN_AND_SKEY/i.test(message) ? 'assistant_unavailable' : 'upstream_error'
@@ -1146,8 +1262,9 @@ async function serveChat(config, req, res, payload, round) {
     if (frame.kind === 'aborted') { terminal = 'aborted'; return }
     if (frame.kind === 'error') {
       terminal = 'error'
-      // 流内认证错误（头已发出，本轮没法重试了）：至少刷新凭据，让下一轮拿到新 token。
-      if (AUTH_ERROR_RE.test(frame.message)) config.refreshCredential?.()
+      // 流内认证错误（头已发出，本轮没法重试了）：强制续期，让下一轮拿到新 token。
+      // 这里不能 await（在流式解析循环里），续期是幂等的单飞请求。
+      if (AUTH_ERROR_RE.test(frame.message)) void config.forceRefreshCredential?.()
       if (wantStream) send({ error: { message: frame.message, status: 500 } })
       return
     }
@@ -1385,6 +1502,37 @@ async function handleCgi(config, req, res) {
 }
 
 /**
+ * 注册后台续期巡检（对齐 OrcaTerm 桌面端 TokenManager：启动先查一次 + 每 5 分钟一次）。
+ * 只做「到期就续」，不主动刷新健康时段的 token；定时器 unref，不阻止进程退出。
+ * @returns {() => void} 停止函数
+ */
+function startTokenRefreshLoop(config) {
+  if (config.tokenRefreshEnabled === false || !config.tokenRefresher) return () => {}
+  let timer = null
+  let stopped = false
+  const tick = async () => {
+    if (stopped) return
+    try {
+      await ensureFreshCredential(config)
+    } catch (error) {
+      warnLine(`AccessToken 续期巡检异常：${error?.message || error}`)
+    }
+  }
+  // 启动即检查：过期凭据在第一个请求到来前就该续好，而不是让用户等一次失败重试。
+  void tick()
+  const intervalMs = Number(config.tokenRefreshCheckMs || 0)
+  if (intervalMs > 0) {
+    timer = setInterval(() => { void tick() }, intervalMs)
+    timer.unref?.()
+  }
+  return () => {
+    stopped = true
+    if (timer) clearInterval(timer)
+    timer = null
+  }
+}
+
+/**
  * 起反代服务。
  * @param {{port?:number, host?:string} & object} options
  * @returns {Promise<{server:import('node:http').Server, port:number, close:()=>Promise<void>}>}
@@ -1407,6 +1555,13 @@ export async function startServer(options = {}) {
           // 当前以哪个客户端身份访问上游（desktop / web），便于确认改动已生效。
           clientIdentity: config.clientIdentity,
           credential: redact(config.credential),
+          // 自续期状态（只报时间/状态码，不含任何 token 值）。
+          tokenRefresh: config.tokenRefreshEnabled === false
+            ? { enabled: false }
+            : {
+              ...(config.tokenRefresher?.state?.() || { enabled: true }),
+              checkSec: Math.round(Number(config.tokenRefreshCheckMs || 0) / 1000),
+            },
           time: new Date().toISOString(),
         })
       }
@@ -1487,10 +1642,17 @@ export async function startServer(options = {}) {
     server.listen(port, host, resolve)
   })
   const actual = server.address()
+  // 后台续期巡检（启动即查一次 + 定时）。unref 定时器，不会吊住进程。
+  const stopRefreshLoop = startTokenRefreshLoop(config)
   return {
     server,
     port: actual.port,
-    close: () => new Promise((resolve) => { server.closeAllConnections?.(); server.close(resolve) }),
+    tokenRefreshState: () => config.tokenRefresher?.state?.() ?? { enabled: false },
+    close: () => new Promise((resolve) => {
+      stopRefreshLoop()
+      server.closeAllConnections?.()
+      server.close(resolve)
+    }),
   }
 }
 

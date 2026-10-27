@@ -518,45 +518,73 @@ console.log('17. 验证新增配置键与重启判定...')
   assert.ok(MANAGER_KEYS.includes('clientIdentity'), '改身份口径要重启后端')
 }
 
-console.log('18. 验证凭据临期自动刷新 (ensureFreshCredential / refreshCredential)...')
+console.log('18. 验证凭据临期自动续期 (ensureFreshCredential / refreshCredential / tokenRefresher)...')
 {
   const future = () => JSON.stringify({ exp: Math.floor((Date.now() + 3600_000) / 1000) })
   const expiring = () => JSON.stringify({ exp: Math.floor((Date.now() + 30_000) / 1000) })
   const jwtOf = (payload) => `header.${Buffer.from(payload()).toString('base64')}.sig`
   const ready = { token: 't', cookieHeader: '', jar: [], csrfCode: '1', uin: 'u', skey: 's' }
 
-  // 18a. 健康凭据（距过期 > 120s）：不刷新、零重读
+  // 18a. 健康凭据（距过期 > 10min）：不重读本地、不续期
   {
     let reads = 0
-    const cfg = { credential: { ...ready, token: jwtOf(future) }, refreshCredential: () => { reads += 1; return { ...ready, token: jwtOf(future) } } }
-    ensureFreshCredential(cfg)
+    const cfg = { credential: { ...ready, token: jwtOf(future) }, tokenRefreshLeadMs: 600000, refreshCredential: () => { reads += 1; return { ...ready, token: jwtOf(future) } } }
+    await ensureFreshCredential(cfg)
     assert.equal(reads, 0)
   }
-  // 18b. 临期（< 120s）：重读并替换
+  // 18b. 临期（< 10min）：本地重读并替换（桌面端若在跑，这一步就够了，零网络）
   {
-    const cfg = { credential: { ...ready, token: jwtOf(expiring) }, refreshCredential: () => { cfg.credential = { ...ready, token: jwtOf(future) }; return cfg.credential } }
-    const got = ensureFreshCredential(cfg)
+    const cfg = { credential: { ...ready, token: jwtOf(expiring) }, tokenRefreshLeadMs: 600000, refreshCredential: () => { cfg.credential = { ...ready, token: jwtOf(future) }; return cfg.credential } }
+    const got = await ensureFreshCredential(cfg)
     assert.equal(got.token, cfg.credential.token)
     assert.notEqual(got.token, '')
   }
   // 18c. exp 解析不出（=0）：与「过期」同等对待，也重读
   {
     let reads = 0
-    const cfg = { credential: { ...ready, token: 'not-a-jwt' }, refreshCredential: () => { reads += 1; return { ...ready, token: jwtOf(future) } } }
-    ensureFreshCredential(cfg)
+    const cfg = { credential: { ...ready, token: 'not-a-jwt' }, tokenRefreshLeadMs: 600000, refreshCredential: () => { reads += 1; return { ...ready, token: jwtOf(future) } } }
+    await ensureFreshCredential(cfg)
     assert.equal(reads, 1)
   }
-  // 18d. 没有 refreshCredential 的 config（手搓的）：原样返回不抛错
+  // 18d. 没有 refreshCredential / tokenRefresher 的 config（手搓的）：原样返回不抛错
   {
     const cfg = { credential: { ...ready } }
-    assert.equal(ensureFreshCredential(cfg), cfg.credential)
+    assert.equal(await ensureFreshCredential(cfg), cfg.credential)
   }
   // 18e. buildConfig 产物自带 refreshCredential，且 cookieFor 读的是**当时的** credential
   {
     const cfg = buildConfig({ credential: { ...ready, cookieHeader: 'a=1', jar: [{ name: 'a', value: '1', domain: 'x.test', path: '/' }] } })
     assert.equal(typeof cfg.refreshCredential, 'function')
+    assert.equal(typeof cfg.forceRefreshCredential, 'function')
+    assert.equal(typeof cfg.tokenRefresher?.ensureFresh, 'function')
     cfg.credential = { ...cfg.credential, cookieHeader: '', jar: [{ name: 'b', value: '2', domain: 'y.test', path: '/' }] }
     assert.equal(cfg.cookieFor('y.test'), 'b=2')
+  }
+  // 18f. 本地重读仍是临期 → 交给 tokenRefresher 走网络续期（先重读、再续期，次序固定）
+  {
+    const order = []
+    const cfg = {
+      credential: { ...ready, token: jwtOf(expiring) },
+      tokenRefreshLeadMs: 600000,
+      tokenRefreshEnabled: true,
+      refreshCredential: () => { order.push('local'); return cfg.credential },
+      tokenRefresher: { ensureFresh: async () => { order.push('network'); return { ok: true, refreshed: true } } },
+    }
+    await ensureFreshCredential(cfg)
+    assert.deepEqual(order, ['local', 'network'])
+  }
+  // 18g. tokenRefresh='off'（enabled=false）：不调用续期器，退回纯重读
+  {
+    let network = 0
+    const cfg = {
+      credential: { ...ready, token: jwtOf(expiring) },
+      tokenRefreshLeadMs: 600000,
+      tokenRefreshEnabled: false,
+      refreshCredential: () => {},
+      tokenRefresher: { ensureFresh: async () => { network += 1; return { ok: true } } },
+    }
+    await ensureFreshCredential(cfg)
+    assert.equal(network, 0)
   }
 }
 

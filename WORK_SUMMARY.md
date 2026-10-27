@@ -579,7 +579,9 @@ Invalid or expired AccessToken 第三次出现（2026-10-25 晚）：用户已�
 反代只在启动时读一次登录态（快照），桌面端刷新再多也不感知。手动重启即恢复，但每 ~2h 一次不可接受。
 
 ### 13.1 机制
-1. uildConfig 产物新增 efreshCredential()：用启动时的同一份参数重跑 esolveCredentials
+1. uildConfig 产物新增 
+efreshCredential()：用启动时的同一份参数重跑 
+esolveCredentials
    （它本来就会从 store/jar 里挑最新 token），替换 config.credential；cookieFor 改为读**当时的**
    credential，刷新即可生效。
 2. nsureFreshCredential(config)：token 的 exp 解析不出（=0）或距过期 < 120s 时触发刷新；
@@ -613,7 +615,8 @@ DSH 的浏览器工具对它不存在。浏览器自动化请用本地直连 pro
 
 ### 14.2 思维链：真 bug，信封 thinking 字段被丢弃
 直连探针发现 deepseek 槽位把思维链放在信封 JSON 的 "thinking" 字段（不是 SSE
-easoningContent 帧）。原 eedUnwrap 单字段状态机只认 	askCompletion/question，
+
+easoningContent 帧）。原 eedUnwrap 单字段状态机只认 	askCompletion/question，
 thinking 整段无声丢弃 —— 会话里 reasoning 总字符为 0 正是它。
 
 修复：eedUnwrap 改多字段循环（thinking→reasoning_content 流式直发、不过正文滤镜；
@@ -1246,8 +1249,9 @@ v0.5.6 修掉契约缺失后，**压缩仍会失败**，只是报错文案变了
 **教训**：造复现用例时，先确认「缺陷的触发条件」在用例里真的成立，别被旁路因素掩盖。
 
 ### 24.6 边界（如实入册）
-- 上游 token TTL 约 **2 小时**，来自桌面端登录态。插件的 `ensureFreshCredential` 只能
+- 上游 token TTL 约 **2 小时**，来自桌面端登录态。v0.5.x 的 `ensureFreshCredential` 只能
   重读桌面端 store、不能自己续期 —— 过期后需重启 OrcaTerm 桌面端。
+  （**v0.6.0 已修**：插件用官方 `OAuthRefreshToken` 自己续期，见 §26。）
 - 摘要**长度**仍由上游模型决定。宿主要求摘要严格短于被压缩内容；区域极小时
   （保留的尾巴本身就超过阈值），任何符合宿主 7 段结构的摘要都不可能更短 ——
   那是宿主的内容护栏与「保留尾巴/阈值」的组合，不是本插件的缺陷。
@@ -1347,3 +1351,108 @@ DSH 侧反复报 `EMPTY_RESPONSE`：「orchaterm-web-api 这一轮没有产出�
 - 救援轮多付一次上游调用（卡死轮本身）；remap 记忆是进程内的，重启后第一次
   零输出会再付一次。
 - 上游**为什么**会卡死会话（~32k 上下文后）属上游内部行为，本插件不可见、未改。
+
+---
+
+## 26. AccessToken 自续期（v0.6.0）
+
+### 26.1 问题
+`Invalid or expired AccessToken` 反复出现（§13 记录了前三次）。§13 的修法只是**重读**
+桌面端落盘的登录态 —— 产新 token 的仍是 OrcaTerm 桌面端自己的 `TokenManager`
+（`log.rs` 里可见「Scheduled token refresh in 110 minutes」「Periodic check started
+(every 5 minutes)」）。它只在客户端运行时工作，且用户还要把窗口切到 AI Session 才会
+触发 `reconcile(focus)`。于是「客户端没开 → token 过期 → 反代报错」是一条必然路径，
+和 §24.6 边界里记的那条一样。
+
+### 26.2 逆向证据（怎么找到的）
+1. 先看 Rust 日志：`[TokenManager] Token exchange response: {"Code":0,…, "AccessToken":…,
+   "RefreshToken":"…", "ExpiresIn":7200, "User":{…}}`，以及
+   `[AuthStore] onServerTokenRefreshed received` / `X-OT-Token-Refreshed: token updated`。
+   日志只给结果、不给 URL。
+2. 桌面端 exe 是 Tauri，前端资源被压进二进制（字符串里只剩 `/vendor/…js` 路径），
+   直接 `strings` 找不到端点。
+3. 改从**线上 Web 版**取同一份前端（`https://orcaterm.com/terminal` 的 script 列表
+   → `cloudcache.tencent-cloud.com/qcloud/orcaterm/orcaterm_app.zh.*.js`），在模块 24530
+   里拿到导出表与两个动作：
+
+```js
+function tt(e){ return JE({action:"OAuthExchangeToken", data:{sessionId:e}}, {skipTokenRestoreWait:true}) }
+function nt(e){ return JE({action:"OAuthRefreshToken", data:{accessToken:e}}, {skipTokenRestoreWait:true}) }
+```
+
+   `JE` 就是本插件早先逆向出来的那个 CGI 调用器（`POST {cgiBase}/cgi/api?action=…`，
+   头 `X-SeqId`/`X-Referer`/`X-CsrfCode`）。也就是说：**续期是 CGI 的一个普通 action，
+   入参就是当前这枚 AccessToken**，不需要 refresh token，也不需要浏览器 OAuth。
+4. 交叉印证：`AuthStore.reconcile()` 的阈值是 `skipRefreshRemainingMs = 3e5`（5 分钟），
+   与 §13 里 120s 的粗糙阈值相比，官方口径宽得多；Rust 侧则是 110 分钟定点续期。
+
+### 26.3 实测边界（2026-10-27，本机）
+- 桌面端 `data.bin` 里的 token 已过期 **约 30 小时**，`OAuthRefreshToken` 仍返回
+  `Code:0` + 新 token（exp ≈ now+2h）→ **续期不要求 token 未过期**；
+- 续期前后 JWT 的 `jti`、`providerCredentialKey`、`credentialGroup`、`source` 全部相同，
+  只有 `iat`/`exp` 变 → 不是轮换，不需要保存 `RefreshToken`；
+- 用新 token 再续一次也成功（链式）；旧 token 在新 token 签发后仍能正常调
+  `DescribeUserAiSetting` → **与桌面端并存不互踢**；
+- 请求头：只带常规 CGI 头就成功；去掉 `Authorization`、去掉 cookie、去掉 `uin` 查询串
+  都仍返回 `Code:0`（但插件仍照常带，保持与真实客户端一致）；
+- 用假 token（`a.b.c` / 空串 / 300 个 x）调用返回 `Error` → 续期确实**校验**入参 token，
+  不是无鉴权接口；
+- 助手通道：只带 `Authorization: Bearer <token>` + 身份头，**不带任何 cookie、不带 `uin`
+  查询串**，`/assistant/chat` 仍返回 200 且正常出字 → 长期不开客户端导致 `sid` 过期也不会挡路。
+
+### 26.4 实现
+- `backend/token-refresh.js`（新）：`createTokenRefresher(config)` →
+  `ensureFresh({force, reason})` / `absorb(jwt)` / `state()`。
+  - 阈值 `tokenRefreshLeadMs`（默认 10 分钟，比官方的 5 分钟更保守）；
+  - 单飞（in-flight 去重）+ 失败冷却（默认 30 秒）；
+  - 只接受**更晚** exp（防止迟到响应把新值覆盖回旧值）；
+  - 不打印任何 token 值。
+- `backend/credentials.js`：
+  - `tokenCachePath()` / `readCachedToken()` / `writeCachedToken()`（临时文件 + rename，
+    POSIX 0600，**只取更晚 exp**）；
+  - `applyAccessToken()`：同步 `token` / `assistantBearer` / jar 与 cookieHeader 里的
+    `ot_session`（只换 Bearer 不换 cookie，CGI 的 cookie 鉴权仍拿旧值 —— 这是关键）；
+  - `resolveCredentials()` 在「续期缓存 / 桌面端 store / jar / 显式凭据」之间按 exp 取最晚
+    （未过期的优先；全过期时取最晚的一个作为续期输入）。
+- `backend/server.js`：`ensureFreshCredential` 改异步（本地重读 → 网络续期）；
+  `startTokenRefreshLoop()` 启动即查 + 每 5 分钟巡检（`unref`，不吊住进程）；
+  认证失败分支改调 `forceRefreshCredential()`（非流式可 `await` 后重试，流内 fire-and-forget）；
+  `/health` 增加 `tokenRefresh` 自述。
+- `backend/upstream.js`：`cgiCall` 支持注入 `fetchImpl`（测试），并在响应里带回
+  `x-ot-token-refreshed`、顺手调用 `config.absorbServerToken`。
+- 契约：`CAPABILITIES` 增 `token-self-refresh`，并列入 `REQUIRED_CAPABILITIES`
+  —— 8793 上若还是旧构建，插件会拒绝复用并提示重启，而不是让用户继续撞过期 token。
+- 配置：`tokenRefresh`（`auto`/`off`）、`tokenCache`、`tokenRefreshLeadMs`、
+  `tokenRefreshCheckMs`；CLI/env 同名口径已接进 `lib/server.js` 与 `backend/run.js`。
+
+### 26.5 验证
+- `test/token_refresh.mjs` 12 组（全部离线，假上游）：健康零请求、临期续期、
+  force、上游拒绝、传输失败、并发单飞、header 只吸收更晚、`ot_session` 同步、
+  缓存合并优先级、`buildConfig` 接线、header 先吸收不误判 `NO_PROGRESS`、
+  本地重读不得把刚续好的 token 换回更旧的。
+- 活体（OrcaTerm 客户端**全程未启动**，本机 8793）：
+  - 用一枚已过期 30 小时的桌面端 token 强制续期 → `ok=true refreshed=true persisted=true`，
+    `sources=desktop-store,tokenRefresh`，缓存文件生成，随后真实对话返回「好」；
+  - `/v1/models` 200（5 个内建模型）、`/orca/cgi GetUserInfo` 200（返回昵称/登录方式）、
+    `/v1/chat/completions` 200 且正文「正常」；
+  - 进程重启后 `/health.credential.sources = ['tokenCache']`、`remainingSec≈7043`
+    → **续期结果跨进程生效**，不需要桌面端补写。
+
+### 26.6 踩到的坑（值得记）
+`cgiCall` 会先把响应头 `X-OT-Token-Refreshed` 吸收进 `config.credential`。第一版在
+**发完请求之后**才取 `previousExp` 做「新 exp 是否更晚」的比较 —— 此时 credential 已被
+header 换成新值，比较变成「新值 vs 新值」，必然判成 `NO_PROGRESS` 并拒绝落盘。
+现场表现：启动日志 `AccessToken 续期失败（NO_PROGRESS）`，但 `/health` 里 token 其实
+已经变新（因为 header 分支已 absorb、已写盘）。
+修法：`previousExp` 在**发请求之前**取值；另外把「header 已让凭据前进」显式当成成功
+（`successByHeader()`），不再依赖 body 里的 `AccessToken`。回归用例即第 11 组。
+
+### 26.7 边界
+- 仍需**一次**初始登录：三处凭据都拿不到 token 时是 `NO_TOKEN`，无解，提示登录一次。
+- 缓存文件等价于账号凭据（bearer token），0600 落盘，不要提交/共享。
+- 续期依赖服务端 `providerCredentialKey` 仍有效；账号被登出/吊销时续期回 `Error`，
+  需要重新登录一次（`/health.tokenRefresh.last.code` 可见）。
+- 这些都是对**当前**上游行为的观测。上游若改动作名、加签名或改鉴权口径，
+  按 26.2 的方法复测（线上 Web bundle → 模块 24530 → `OAuthRefreshToken`），别沿用结论。
+- 不写回桌面端 `data.bin`：Tauri Store 有自己的写入时机，跨进程改容易打架；
+  两套凭据按 exp 取最晚共存即可。

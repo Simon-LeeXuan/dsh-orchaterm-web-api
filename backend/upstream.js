@@ -120,12 +120,21 @@ function hostOf(url) {
 
 /**
  * 调一次 CGI，把 `{data:{Response}}` 拆成值或错误。
- * @returns {Promise<{ok:boolean, data?:unknown, code?:string, message?:string, upstreamCode?:string}>}
+ *
+ * 响应头 `X-OT-Token-Refreshed` 是服务端的滑动续期（桌面端同款行为）：
+ * 一旦出现就交给 `config.absorbServerToken`，不需要额外请求。
+ *
+ * @param {object} config
+ * @param {string} action
+ * @param {object} [data]
+ * @param {{signal?:AbortSignal, fetchImpl?:Function}} [options]
+ * @returns {Promise<{ok:boolean, data?:unknown, code?:string, message?:string, upstreamCode?:string, newToken?:string}>}
  */
 export async function cgiCall(config, action, data = {}, options = {}) {
+  const doFetch = options.fetchImpl || globalThis.fetch
   let response
   try {
-    response = await fetch(cgiUrl(config, action), {
+    response = await doFetch(cgiUrl(config, action), {
       method: 'POST',
       headers: cgiHeaders(config),
       body: JSON.stringify({ action, data }),
@@ -134,14 +143,23 @@ export async function cgiCall(config, action, data = {}, options = {}) {
   } catch (error) {
     return { ok: false, code: 'TRANSPORT', message: `CGI ${action} 请求失败: ${error?.message || error}` }
   }
+  // 服务端可能在**任何**已认证响应上回一枚新 token；先收，再判 body。
+  const newToken = response.headers?.get?.('x-ot-token-refreshed') || ''
+  if (newToken !== '' && typeof config.absorbServerToken === 'function') {
+    try {
+      config.absorbServerToken(newToken)
+    } catch {
+      // 吸收失败不该影响这次调用
+    }
+  }
   if (!response.ok) {
-    return { ok: false, code: 'SERVER', message: `CGI ${action} HTTP ${response.status}` }
+    return { ok: false, code: 'SERVER', message: `CGI ${action} HTTP ${response.status}`, newToken }
   }
   let payload
   try {
     payload = await response.json()
   } catch {
-    return { ok: false, code: 'SERVER', message: `CGI ${action} 响应不是 JSON` }
+    return { ok: false, code: 'SERVER', message: `CGI ${action} 响应不是 JSON`, newToken }
   }
   const body = payload?.data?.Response
   if (body && typeof body === 'object' && body.Error) {
@@ -152,9 +170,10 @@ export async function cgiCall(config, action, data = {}, options = {}) {
       code: CGI_ERROR_MAP[upstreamCode] || (upstreamCode ? 'SERVER' : 'TRANSPORT'),
       message: `${action}: ${message}`,
       upstreamCode,
+      newToken,
     }
   }
-  return { ok: true, data: body }
+  return { ok: true, data: body, newToken }
 }
 
 /** Assistant 的查询串：name/mode/csrfCode/uin（前端同款参数集）。 */

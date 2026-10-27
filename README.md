@@ -16,6 +16,10 @@
 1. **凭据来源**：
    - 桌面端数据持久化在 `%APPDATA%\com.orcaterm-desktop.app\data.bin`（明文 JSON，包含 `oauth_access_token` JWT、`userId` 等）和 `%LOCALAPPDATA%\com.orcaterm-desktop.app\.cookies`（Tauri Cookie Jar，包含 `ot_session` 与 `sid`）。
    - 插件后端会自动探测并读取本地登录态，并在日志与接口中执行严格脱敏。
+   - **AccessToken 由插件自己续期（v0.6.0）**：用官方 CGI 动作 `OAuthRefreshToken` 换新，结果落在
+     `~/.dsh/orca-token-cache.json`。因此**不需要一直开着 OrcaTerm 客户端** —— 只要历史上登录过
+     一次（桌面端登录态或 `~/.dsh/orca-credentials.json` 里有一枚 token），之后由插件接管续期。
+     详见下文「AccessToken 自续期」。
 2. **通道分离与上游鉴权**：
    - **CGI 控制台通道**（桌面端口径：`https://api.orcaterm.cloud.tencent.com/cgi/api`）：
      - 认桌面端的 Bearer JWT 和 `ot_session` Cookie。
@@ -29,7 +33,7 @@
        只是 Tauri 开发服务器的 CSP 白名单，不是生产 API。
    - **Assistant AI 对话通道**（`https://lightai.cloud.tencent.com/assistant/chat`）：
      - 基于 SSE 流式传输，上游要求 `Cookie`（含 `uin`、`skey` 等）结合 `authorization: Bearer` 双重鉴权。
-     - 凭据现由 `~/.dsh/orca-credentials.json` 与本地桌面端持久化联合管理。插件具备**Token 寿命比对与平滑回退能力**，当手工传入的 Token 过期时，反代会自动从本地桌面端 `.cookies` 中拾取最新的 `ot_session` 实现免维护长效保活。
+     - 凭据由 `~/.dsh/orca-credentials.json`、本地桌面端持久化与插件自续期缓存联合管理；Bearer 就是上面那枚 AccessToken，续期后 `authorization` 与 `ot_session` 会同步换新。
 3. **Agent 协议动态解包与降噪机制**：
    - OrcaTerm 上游服务以运维 Agent 状态机组织输出，包含回答动作（`action: "completion"` / 字段 `taskCompletion`）与反问澄清动作（`action: "ask"` / 字段 `question`）。
    - 反代内核内置字符级流式状态机（`OrcaStreamFilter`），打字机式实时过滤外层 JSON 脚手架与 Markdown 语法围栏，拦截上游的历史反射（`type: "human"`）与草稿撤销帧（`remove-*`），杜绝重复问候语与协议标签泄露。
@@ -223,14 +227,121 @@ v0.5.4 用两层守卫兜住：
 
 ---
 
+## AccessToken 自续期（v0.6.0）
+
+### 为什么需要
+
+AccessToken 是 **2 小时**有效期的 JWT。v0.5.x 只能「重读桌面端登录态」——
+桌面端不开、或开了但一直没聚焦窗口，token 就没人续，反代随即报
+`Invalid or expired AccessToken`，必须手动打开 OrcaTerm 触发一次刷新才能恢复。
+
+v0.6.0 把续期搬进插件：**只要曾经登录过一次，之后不再需要 OrcaTerm 客户端常驻。**
+
+### 逆向后拿到的官方接口
+
+来源：OrcaTerm 1.6.6 前端 bundle `orcaterm_app.zh.*.js` 模块 24530 + Rust 侧
+`[TokenManager]` 日志，双向印证：
+
+| CGI action | 入参 | 用途 |
+| --- | --- | --- |
+| `OAuthExchangeToken` | `{sessionId}` | 浏览器 OAuth 回调后的首次换取（`orcaterm://oauth_callback?session_id=…`） |
+| `OAuthRefreshToken` | `{accessToken}` | **续期**；入参就是当前这枚 AccessToken |
+
+响应形如 `{Code:0, Message:"Success", AccessToken, ExpiresIn:7200}`，同时响应头
+`X-OT-Token-Refreshed` 里也回一份同样的 JWT。官方前端的 `reconcile()`
+在剩余寿命 `<= 5min` 时调它，Rust `TokenManager` 则是「110 分钟后续 + 每 5 分钟巡检」。
+
+本机实测（2026-10-27）确认的边界：
+
+- **过期 30 小时后调用仍成功** —— 续期不要求 token 未过期；
+- 续期前后 JWT 的 `jti` / `providerCredentialKey` **完全一致**，只有 `iat`/`exp` 变
+  → 不需要 `RefreshToken`，也不存在 refresh token 轮换；
+- 链式续期成立（拿新 token 再换一次仍成功）；
+- 旧 token 在新 token 签发后**仍然可用** → 插件续期不会把桌面端踢下线；
+- 请求头只需常规 CGI 头（`X-SeqId` / `X-Referer` / `X-CsrfCode` + 身份口径），
+  `Authorization` / `Cookie` / `uin` 查询串都不是硬要求（仍照常带，保持与真实客户端一致）。
+
+### 机制
+
+`backend/token-refresh.js`：
+
+1. **到期前主动续**：剩余寿命 < `tokenRefreshLeadMs`（默认 10 分钟）时，先本地重读
+   （桌面端若在跑通常已经替我们续过了，零网络），仍然临期才调 `OAuthRefreshToken`；
+2. **后台巡检**：启动即查一次，之后每 `tokenRefreshCheckMs`（默认 5 分钟）检查一次
+   —— 对齐桌面端 `Periodic check started (every 5 minutes)`；
+3. **认证失败强制续**：非流式分支 `Invalid or expired AccessToken` 时强制续期后
+   **重试一次**；流内认证错误（头已发出、本轮无法重试）也强制续期，让下一轮拿到新 token；
+4. **滑动续期吸收**：任何已认证响应带 `X-OT-Token-Refreshed` 时，只在新 `exp` 更晚时吸收；
+5. **落盘**：成功的 token 写入 `~/.dsh/orca-token-cache.json`（`{accessToken, expiresAt, refreshedAt}`，
+   POSIX `0600`，临时文件 + rename 原子写，**只取更晚 exp**）。反代进程重启后直接接着用；
+6. **单飞 + 冷却**：并发回合只发一次续期请求；失败后 30 秒内自动路径不再重试。
+
+换新时同时同步 `token`、`assistantBearer` 和 jar/cookieHeader 里的 `ot_session`
+—— 只换 Bearer 不换 cookie，CGI 的 cookie 鉴权仍会拿旧值。
+
+### 配置
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `tokenRefresh` | `'auto'` | `'off'` 退回 v0.5.x 的「只重读桌面端登录态」 |
+| `tokenCache` | `''`（`~/.dsh/orca-token-cache.json`） | 续期结果缓存位置 |
+| `tokenRefreshLeadMs` | `600000`（10 分钟） | 提前多久续期 |
+| `tokenRefreshCheckMs` | `300000`（5 分钟） | 后台巡检间隔 |
+
+环境变量同名口径：`ORCA_TOKEN_REFRESH` / `DSH_ORCA_TOKEN_CACHE` /
+`ORCA_TOKEN_REFRESH_LEAD_MS` / `ORCA_TOKEN_REFRESH_CHECK_MS`；CLI：
+`--token-refresh` / `--token-cache` / `--token-refresh-lead-ms` / `--token-refresh-check-ms`。
+
+### 怎么确认它在工作
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8793/health | ConvertTo-Json -Depth 6
+```
+
+`tokenRefresh` 字段只报时间与状态码（不含 token）：
+
+```jsonc
+{
+  "enabled": true,
+  "expiresAt": "2026-10-28T01:28:52.000Z",
+  "remainingSec": 7043,
+  "leadSec": 600,
+  "checkSec": 300,
+  "cachePath": "C:\\Users\\<user>\\.dsh\\orca-token-cache.json",
+  "cacheExpiresAt": "2026-10-28T01:28:52.000Z",
+  "attempts": 1,
+  "lastRefreshedAt": "2026-10-27T15:28:52.000Z",
+  "last": { "ok": true, "code": "OK", "message": "", "reason": "expiring", "at": "..." }
+}
+```
+
+### 边界（如实记录）
+
+- **需要一次初始登录**：从来没有登录过 OrcaTerm（`data.bin` / `.cookies` / `credentialsFile`
+  里都没有 token）时仍然无法凭空造一枚，此时 `/health.tokenRefresh.last.code` 是 `NO_TOKEN`，
+  提示登录一次；登录后即可长期自续。
+- 助手通道实测**只认 Bearer**（不带 cookie、不带 `uin` 查询串也返回 200 并出字），
+  所以 `sid` 这类会话 cookie 过期不会挡住长期自续；插件仍照常带 cookie，保持与客户端一致。
+- 缓存文件里是**一枚 bearer token**（等价于账号凭据），已按 0600 落盘；不要把该文件提交/共享。
+- 续期建立在「`providerCredentialKey` 在服务端仍有效」之上。若账号被登出/吊销，
+  续期会返回 `Error`（`last.code` 可见），此时需要重新登录一次。
+- 这些都是对**当前**上游行为的观测，不构成对未来的保证；上游若换动作名/加签名，
+  先按本文方法复测，不要沿用结论。
+- 不写回桌面端的 `data.bin`：桌面端的 Tauri Store 有自己的写入时机，跨进程改它的文件
+  容易打架；插件用自己的缓存并与之**按 exp 取最晚**，两套并存互不干扰。
+
+---
+
 ## 验证
 
 ```powershell
-npm test                       # 离线：cordis/DEFAULTS 静态校验 + 28 组 smoke + 3 组畸形信封回归 + 2 组受理超时回归（见下）
+npm test                       # 离线：cordis/DEFAULTS 静态校验 + smoke + 12 组续期回归 + 3 组零输出救援 + 3 组畸形信封 + 2 组受理超时
 npm run test:live:regression   # 活体：需反代在跑 + 有效登录态，17 项断言，会让模型真发工具调用
 npm run test:malformed         # 只跑畸形信封回归（假上游驱动，不需要登录态）
-# 凭据说明（v0.3.3）：token 临期/过期时反代自动重读 OrcaTerm 桌面端登录态，并在认证失败时自动重试一次；
-# 只要桌面端开着就不用再手动重启反代。桌面端没开且 token 过期时报 AUTH 属预期。
+npm run test:token-refresh     # 只跑 AccessToken 自续期（假上游，不需要登录态）
+# 凭据说明（v0.6.0）：临期/过期时反代先重读桌面端登录态，仍临期就调官方 OAuthRefreshToken 自续期，
+# 结果落到 ~/.dsh/orca-token-cache.json；认证失败还会强制续期并重试一次。
+# 因此不必一直开着 OrcaTerm —— 只有「从未登录过 / 登录态被吊销」才需要重新登录一次。
 # 宿主侧契约回归（v0.5.6）：两份 spec 都需要在宿主仓库根目录跑 ——
 #   cd C:\AITask\deepseek-harness
 #   Copy-Item <插件>\test\host_contract.spec.ts packages\compaction\compaction-basic\tests\

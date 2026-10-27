@@ -1,5 +1,71 @@
 All notable changes to the `dsh-orchaterm-web-api` plugin will be documented in this file.
 
+## [0.6.0] - 2026-10-27
+
+AccessToken 自己续期（`OAuthRefreshToken`）—— 不再需要把 OrcaTerm 客户端开着。
+
+### Symptom
+`本轮运行失败 orchaterm-web-api 错误: Invalid or expired AccessToken`；必须先手动打开
+OrcaTerm、聚焦 AI Session 触发一次 token 刷新，反代才恢复。每 ~2 小时复发一次。
+
+### Root cause
+v0.5.x 的 `ensureFreshCredential` 只会**重读**桌面端 `data.bin` / `.cookies` 里的登录态。
+谁来产生新 token？只有 OrcaTerm 桌面端的 `TokenManager`（110 分钟续一次 + 5 分钟巡检），
+而它只在客户端运行时工作。客户端没开（或窗口长期失焦）时，落盘的 token 过了 2 小时就没人管，
+反代便一直拿着过期快照去请求。
+
+### Reverse engineering
+取自 OrcaTerm 1.6.6 前端 bundle（`orcaterm_app.zh.*.js` 模块 24530）与 Rust 日志，双向印证：
+
+| CGI action | 入参 | 说明 |
+| --- | --- | --- |
+| `OAuthExchangeToken` | `{sessionId}` | 首次登录换取（`orcaterm://oauth_callback?session_id=…`） |
+| `OAuthRefreshToken` | `{accessToken}` | 续期；**入参就是当前 AccessToken** |
+
+响应 `{Code:0, Message, AccessToken, ExpiresIn:7200}`，响应头 `X-OT-Token-Refreshed`
+里另有同一枚 JWT（官方 `AuthStore.onServerTokenRefreshed` 消费它）。
+
+本机实测（2026-10-27）：
+- token **过期 30 小时后**调用 `OAuthRefreshToken` 仍返回 `Code:0` 和新 token；
+- 续期前后 JWT 的 `jti` / `providerCredentialKey` 一致，只有 `iat`/`exp` 变（无 refresh token 轮换）；
+- 链式续期成立；旧 token 在新 token 签发后仍可用（不会把桌面端踢下线）；
+- 常规 CGI 头即可，`Authorization` / `Cookie` / `uin` 查询串都不是硬要求。
+
+### Fix
+- 新增 `backend/token-refresh.js`：单飞刷新 + 失败冷却 + 只落更晚 exp + `X-OT-Token-Refreshed` 吸收。
+- `backend/credentials.js`：新增续期缓存 `~/.dsh/orca-token-cache.json`（0600、原子写），
+  解析时在「缓存 / 桌面端 store / jar」之间按 exp 取最晚；`applyAccessToken` 同步
+  `token`、`assistantBearer` 与 `ot_session`。
+- `backend/server.js`：`ensureFreshCredential` 改为异步，先本地重读、仍临期则网络续期；
+  启动即查一次 + 每 5 分钟巡检；认证失败强制续期后重试一次（流内失败则只续期，供下一轮）；
+  `/health` 新增 `tokenRefresh` 自述（只报时间/状态码）。
+- `backend/upstream.js`：`cgiCall` 支持注入 `fetchImpl`，并回传/吸收 `X-OT-Token-Refreshed`。
+- 契约：能力清单新增 `token-self-refresh`（并列入必需项，旧构建会被拒绝复用）。
+- 新配置：`tokenRefresh` / `tokenCache` / `tokenRefreshLeadMs` / `tokenRefreshCheckMs`
+  （CLI/env 同名口径见 README）。
+- `install.ps1`：自检增加 `token_refresh` 单测、续期缓存状态与 `/health.tokenRefresh` 展示。
+
+### Verification
+- `test/token_refresh.mjs` 12 组离线回归（健康零请求 / 临期续期 / force / 上游拒绝 /
+  传输失败 / 并发单飞 / header 只吸收更晚 / ot_session 同步 / 缓存合并优先级 /
+  buildConfig 接线 / header 先吸收不误判 `NO_PROGRESS` / 本地重读不得把新 token 换回旧值）。
+  **第 11 组对应实报缺陷**：`cgiCall` 会先把响应头吸收进 credential，若在请求之后才取
+  `previousExp`，就会误判成「没有更晚的过期时间」并拒绝落盘（首跑现场复现过）；
+  第 12 组锁住并发续期 + 缓存写失败时「本地重读只看到桌面端旧值」的回退路径。
+- 活体（OrcaTerm 客户端全程未启动）：从一枚**已过期 30 小时**的桌面端 token 强制续期成功，
+  缓存落盘，随后 `/v1/models`、`/orca/cgi GetUserInfo`、`/v1/chat/completions` 全部 200
+  且正常出字。
+- 另：一次真实重启验证中，残留的过期 token 经新后端续期后写进缓存，**下一个进程启动直接
+  从缓存接着用**（`/health.credential.sources = ['tokenCache']`），证明「重启不丢」成立。
+
+### Boundaries
+- 仍需**一次**初始登录（`data.bin` / `.cookies` / `credentialsFile` 里要有一枚 token）；
+  从未登录过时报 `NO_TOKEN`，提示登录一次。
+- 缓存文件是一枚 bearer token，已按 0600 落盘；不要提交或共享。
+- 续期依赖服务端 `providerCredentialKey` 仍有效；账号被登出/吊销时续期会回 `Error`，
+  需重新登录一次。
+- 不写回桌面端 `data.bin`（避免与 Tauri Store 的写入时机打架），两套凭据按 exp 取最晚共存。
+
 ## [0.5.8] - 2026-10-27
 
 修「映射会话被上游卡死后永久零输出」——DSH 侧表现为 `EMPTY_RESPONSE`
