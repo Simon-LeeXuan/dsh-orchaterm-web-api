@@ -1252,3 +1252,44 @@ v0.5.6 修掉契约缺失后，**压缩仍会失败**，只是报错文案变了
   （保留的尾巴本身就超过阈值），任何符合宿主 7 段结构的摘要都不可能更短 ——
   那是宿主的内容护栏与「保留尾巴/阈值」的组合，不是本插件的缺陷。
 - 压缩**区域怎么选、阈值怎么算**属宿主策略，未改。
+
+### 24.7 one-shot CLI 走完整宿主栈的真实验证
+宿主的一次性 CLI（`dsh --profile <name> "<任务>"`，headless profile + orcaterm 插件）能
+把 **llm runtime + token-meter + compaction** 全链路真实跑一遍。做法：
+
+1. 建一个 one-shot profile：`bundles = [dsh-base, dsh-headless, dsh-orchaterm-web-api]`，
+   `agent-default-model` 指向 `orcaterm-web-api/hy4-preview`，**压缩配置沿用宿主默认**
+   （不要为了「触发」去调低阈值 —— 那是自造假象，见 §24.8）。
+2. 轮 A / 轮 B：同一 `--session-id` 连跑两轮，把历史堆到阈值以上
+   （每轮约 25000 tokens；任务文本经 stdin 喂，避免命令行长度上限）。
+3. 轮 C：`--patch` 覆盖 `agent-default-model` → 切到 `hy3`（窗口 128000）→
+   触发宿主「模型切换 → 压缩」分支。
+
+实测结果（会话日志 `session.v4.jsonl.zstd` 里逐条核对）：
+
+```
+compaction/start  ×1
+compaction/summary ×1   shadowedTokenCount=32820  range={start:8,end:15}  llmStreamCall=true
+compaction/end    ×1   （无 error）
+请求头 → hy4-preview / hy4-preview / hy3      ← 模型切换放行
+最终答案 → MARKER-ORCA-COMPACTION-7731        ← 从检查点正确恢复
+```
+
+摘要正文是宿主的 7 段结构化检查点，且**逐字引用了被压缩的对话**：
+「用户的原始问题（逐字）：『MARKER-ORCA-COMPACTION-7731 是什么？请用 800 字详细说明。』」
+
+### 24.8 宿主侧的两条边界（与本插件无关，别误判）
+实测撞到过两条宿主策略边界，**宿主自带路由同样如此**（它的脚本化摘要也有 400 tokens 量级）：
+
+1. `no safe compaction range can reduce context below threshold`
+   宿主按「保留尾巴预算 = 窗口 × retainRatio（默认 0.16）」保留最近内容。
+   **若最近内容的 token 数超过该预算**，就没有可压缩区间。
+   例：hy3（窗口 128000）→ 预算 19169；而最近的几个节点共 70K tokens → 无区间。
+2. `summary is not smaller than the shadowed content`
+   压缩成功但**降不到阈值以下**时，宿主会重试；重试会去压缩「刚写下的检查点」
+   （通常一百多 token），而新的 7 段摘要有几百 token → 比不过 → 报这个错。
+   例：`417 estimated framed tokens >= 112`。
+
+⇒ 造复现用例时，**别靠调低阈值来「触发」**：阈值一旦低于「保留尾巴」的体积，
+宿主就会进入「降不到阈值 → 重试 → 压检查点」的路径，报的错与真实场景不同。
+真实触发要靠**历史长度**，并且保证最近内容足够多。

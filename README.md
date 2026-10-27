@@ -252,6 +252,25 @@ orcaterm 路由时，摘要请求会原样经过插件适配器打到**真实 Or
 OrcaTerm 的 SSE 方言回话，同时**记录上游到底收到了什么**，断言压缩轮确实带了
 `historyMessages`、且里面是待压缩对话的内容。
 
+### 走完整宿主栈的真实验证（one-shot CLI）
+
+宿主的一次性 CLI 能把 **llm runtime + token-meter + compaction** 全链路真实跑一遍：
+
+```powershell
+# 一个 headless + orcaterm 插件的 profile（本机已建好 C:\Users\Admin\.dsh\profiles\orca-oneshot）
+cd C:\AITask\deepseek-harness
+node --import tsx/esm apps/cli/src/bin.ts --profile orca-oneshot "<任务>"
+# 任务文本可经 stdin 喂（避免命令行长度上限）：
+Get-Content task.txt -Raw | node --import tsx/esm apps/cli/src/bin.ts --profile orca-oneshot
+# 切模型用 --patch 覆盖（覆盖 agent-default-model）：
+node --import tsx/esm apps/cli/src/bin.ts --profile orca-oneshot --patch switch.yml --session-id <id> "<任务>"
+```
+
+要点：**压缩配置沿用宿主默认**，触发靠**历史长度**（把历史堆过目标模型的阈值），
+不要为了「触发」去调低 `thresholdRatio` —— 阈值一旦低于「保留尾巴」的体积，宿主就会
+进入「降不到阈值 → 重试 → 压刚写的检查点」的路径，报的错与真实场景不同
+（详见 WORK_SUMMARY §24.8）。
+
 ### 压缩摘要轮的特殊处理（v0.5.7）
 
 宿主的上下文压缩把摘要作为**辅助 LLM 调用**（`purpose: 'compaction'`）发出，消息体是

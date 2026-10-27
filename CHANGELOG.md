@@ -56,8 +56,16 @@ All notable changes to the `dsh-orchaterm-web-api` plugin will be documented in 
   2）执行环境说明……」—— 与对话完全无关。
 - 修复后同一测试：模型切换放行、压缩检查点写入、摘要正文正确描述对话内容、
   **上游调用次数 = 1**（修复前需 2 次）。
+- **one-shot CLI 走完整宿主栈（llm runtime + token-meter + compaction）真实验证**：
+  用 `dsh --profile <one-shot profile> "<任务>"`（headless profile + orcaterm 插件）跑三轮：
+  ① 两轮 hy4-preview 把历史堆到阈值以上；② `--patch` 切到 hy3 → 触发「模型切换 → 压缩」。
+  会话日志证实：**恰好 1 次压缩**（`compaction/start` / `summary` / `end` 各一，无重试无报错，
+  `llmStreamCall: true`），遮蔽 32820 tokens，摘要是宿主的 7 段结构化检查点且**逐字引用了
+  对话**（「用户的原始问题（逐字）：『MARKER-ORCA-COMPACTION-7731 是什么？…』」），
+  第三个请求头是 hy3 → 模型切换放行，最终从检查点正确恢复了答案。
 - `npm test` 全绿（config_check + smoke 28 组 + malformed 3 组 + report_timeout 2 组 +
   compaction_summary 5 组）。
+- 活体回归 **17/17**（真实 OrcaTerm 会话：思维链、工具调用、工具结果回传、上下文对账）。
 
 ### 边界（如实入册）
 - 上游 token 的 TTL 约 **2 小时**，来自 OrcaTerm 桌面端登录态。插件的
@@ -66,6 +74,14 @@ All notable changes to the `dsh-orchaterm-web-api` plugin will be documented in 
 - 压缩摘要的**长度**仍由上游模型决定。宿主的护栏要求摘要严格短于被压缩内容；
   区域极小（例如被保留的尾巴本身就超过阈值）时，任何符合宿主 7 段结构的摘要都不可能
   更短 —— 那是宿主的内容护栏与「保留尾巴/阈值」的组合，不是本插件的缺陷。
+  **宿主自带路由同样如此**（它的脚本化摘要也有 400 tokens 量级）。
+- 宿主还有两条**与本插件无关**的边界，一并入册（实测撞到过，别误判成插件缺陷）：
+  - `no safe compaction range can reduce context below threshold`：宿主按
+    「保留尾巴预算 = 窗口 × retainRatio(默认 0.16)」保留最近内容；**若最近内容的
+    token 数超过该预算**，就没有可压缩区间（切到小窗模型 + 大尾巴时尤其明显）。
+  - `summary is not smaller than the shadowed content`：压缩成功但**降不到阈值以下**时，
+    宿主会重试；重试会去压缩「刚写下的检查点」（通常一百多 token），而新的 7 段摘要
+    有几百 token → 比不过 → 报这个错。宿主自带路由同样会这样。
 - 本轮仍只修「上游看到什么」。压缩**区域如何选**、**阈值怎么算**属宿主策略，未改。
 
 ## [0.5.6] - 2026-10-27
